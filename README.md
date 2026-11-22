@@ -60,8 +60,9 @@ python3 wafbypass.py -i         # interactive shell, no restart between scans
 python3 wafbypass.py -u URL --watch 60
 ```
 
-The menu runs in the alternate screen (no scrollback, no duplicated banner
-after each action) and redraws on resize. It prompts for URL, mode, level and
+The menu runs in the alternate screen (no duplicated banner, redraws on
+resize). Actions run outside it, so scan output is printed into the normal
+buffer and stays scrollable; press Enter to return to the fixed menu. It prompts for URL, mode, level and
 repeat. Before the level prompt it
 prints what each level adds (1 obvious rewrite, 2 single parser differential,
 3 double layer, 4 null/terminal framing), then prints the same report as the

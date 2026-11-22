@@ -516,6 +516,21 @@ FINDING_MARKERS = (b"admin", b"dashboard", b"user list", b"users",
                    b"confidential", b"internal", b"private", b"flag{")
 
 
+NIK_PROVINCES = set(range(11, 20)) | {21} | set(range(31, 37)) \
+    | set(range(51, 54)) | set(range(61, 66)) | set(range(71, 77)) \
+    | {81, 82} | set(range(91, 95))
+
+
+def _valid_nik(raw):
+    text = raw.decode("latin-1", "replace")
+    if len(text) != 16 or not text.isdigit():
+        return False
+    if int(text[:2]) not in NIK_PROVINCES:
+        return False
+    day, month = int(text[6:8]), int(text[8:10])
+    return 1 <= day <= 31 and 1 <= month <= 12
+
+
 def _mask_nik(value):
     text = value.decode("latin-1", "replace")
     if len(text) != 16:
@@ -557,9 +572,11 @@ def finding(resp):
                         for x in EMAIL_RE.findall(body)))[:10]
     phones = sorted(set(x.decode("latin-1", "replace")
                         for x in PHONE_RE.findall(body)))[:10]
-    raw_niks = sorted(set(NIK_RE.findall(body)))[:10]
+    raw_niks = sorted(set(x for x in NIK_RE.findall(body) if _valid_nik(x)))[:10]
     niks = [_mask_nik(x) for x in raw_niks]
-    sensitive = [m.decode() for m in SENSITIVE if m in low][:8]
+    sensitive = [m.decode() for m in SENSITIVE
+                 if (m == b"flag{" and m in low)
+                 or re.search(rb"\b" + re.escape(m) + rb"\b", low)][:8]
     high_secrets = [m for m in sensitive
                     if m in ("password", "passwd", "api_key", "apikey",
                              "secret", "token", "credential", "creditcard",
@@ -1533,11 +1550,15 @@ def _menu_lines(width, height):
     return lines[:max(8, height - 2)]
 
 
-def _alt_enter():
-    """Switch to the alternate screen so the UI never enters scrollback."""
+def _alt_enter(wipe=False):
+    """Switch to the alternate screen so the menu never enters scrollback.
+
+    wipe=True also erases scrollback, used only for the first entry so reports
+    printed in the normal buffer stay scrollable.
+    """
     if not sys.stdout.isatty():
         return False
-    sys.stdout.write("\033[?1049h\033[2J\033[3J\033[H")
+    sys.stdout.write("\033[?1049h\033[2J" + ("\033[3J" if wipe else "") + "\033[H")
     sys.stdout.flush()
     return True
 
@@ -1662,7 +1683,7 @@ def _menu_action(choice, args):
 
 
 def welcome_menu(args):
-    full = _alt_enter()
+    full = _alt_enter(wipe=True)
     if full:
         def on_resize(signum, frame):
             _draw_menu()
@@ -1688,9 +1709,12 @@ def welcome_menu(args):
             if choice is None or choice == "0":
                 print("bye.")
                 return 0
+            if full:
+                _alt_leave(True)
             _menu_action(choice, args)
             if full:
                 _ask("Enter to return to menu")
+                _alt_enter()
     finally:
         _alt_leave(full)
 
