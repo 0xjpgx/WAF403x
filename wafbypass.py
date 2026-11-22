@@ -1447,12 +1447,14 @@ def repl(args):
 
 
 def watch(args, interval):
-    print("[i] watch every %ds, Ctrl-C to stop" % interval)
     last = None
+    active = _alt_enter()
 
     def show():
         if last is not None:
             sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write("[i] watch every %ds, Ctrl-C to stop\n\n"
+                             % interval)
             sys.stdout.write(render(last, args.json, term_width()) + "\n")
             sys.stdout.flush()
 
@@ -1466,6 +1468,8 @@ def watch(args, interval):
             time.sleep(max(1, interval))
     except KeyboardInterrupt:
         return 0
+    finally:
+        _alt_leave(active)
 
 
 def _ask(prompt, default=""):
@@ -1491,131 +1495,200 @@ def _print_banner():
     print()
 
 
-def welcome_menu(args):
-    options = [
-        ("1", "Scan URL (path/header/encoding sweep)"),
-        ("2", "HTTP/2 fingerprint scan"),
-        ("3", "Solve JS/CAPTCHA challenge, then scan"),
-        ("4", "Watch mode (repeat on interval, Ctrl-C to stop)"),
-        ("5", "Interactive shell (type commands, stays alive)"),
-        ("6", "Real WAF lab (ModSecurity CRS via podman)"),
-        ("7", "Help / examples"),
-        ("0", "Exit"),
-    ]
-    while True:
-        _print_banner()
-        width = term_width()
-        print("  MENU".ljust(width))
-        for key, label in options:
-            line = "  %s) %s" % (key, label)
-            for wrapped in textwrap.wrap(line, width=max(24, width - 2)) or [""]:
-                print(wrapped)
-        print()
-        choice = _ask("select menu", "1")
-        if choice is None or choice == "0":
-            print("bye.")
-            return 0
-        if choice == "1":
-            url = _ask("target URL", args.url or "")
-            if not url:
-                print("[x] empty URL\n")
-                continue
-            args.url = url
-            args.mode = _ask("mode (path/header/method/body/encoding/cookie/"
-                             "ctype/size/all)", args.mode)
-            if args.mode not in MODE_CHOICES:
-                print("[x] unknown mode\n")
-                continue
-            print(LEVEL_HELP)
-            lvl = _ask("level 1-4 (see above)", str(args.level))
-            args.level = int(lvl) if lvl in ("1", "2", "3", "4") else 4
-            rep = _ask("repeat", str(args.repeat))
-            args.repeat = int(rep) if rep.isdigit() else 2
-            data, code = run(args)
-            if data:
-                print()
-                print(render(data, args.json, term_width()))
-                print()
-            else:
-                print("[x] run failed (exit %d)\n" % code)
-        elif choice == "2":
-            url = _ask("target URL")
-            if not url:
-                print("[x] empty URL\n")
-                continue
-            args.url = url
-            args.mode = "h2"
-            args.http2 = _ask("profil h2 (chrome/firefox/safari/nghttp2/plain)",
-                              "chrome")
-            if args.http2 not in h2.PROFILES:
-                args.http2 = "chrome"
-            data, code = run(args)
-            if data:
-                print()
-                print(render(data, args.json, term_width()))
-                print()
-            else:
-                print("[x] run failed (exit %d)\n" % code)
-        elif choice == "3":
-            url = _ask("target URL")
-            if not url:
-                print("[x] empty URL\n")
-                continue
-            args.url = url
-            args.solve_challenge = True
-            args.cookies = True
-            args.follow = 2
-            print("[i] solving in a browser, 2-5 minutes; cookie cache TTL 900 s...")
-            data, code = run(args)
-            if data:
-                print()
-                print(render(data, args.json, term_width()))
-                print()
-            else:
-                print("[x] run failed (exit %d)\n" % code)
-        elif choice == "4":
-            url = _ask("target URL")
-            if not url:
-                print("[x] empty URL\n")
-                continue
-            args.url = url
-            interval = _ask("interval seconds", "60")
-            return watch(args, int(interval) if interval.isdigit() else 60)
-        elif choice == "5":
-            return repl(args)
-        elif choice == "6":
+MENU_OPTIONS = [
+    ("1", "Scan URL (path/header/encoding sweep)"),
+    ("2", "HTTP/2 fingerprint scan"),
+    ("3", "Solve JS/CAPTCHA challenge, then scan"),
+    ("4", "Watch mode (repeat on interval, Ctrl-C to stop)"),
+    ("5", "Interactive shell (type commands, stays alive)"),
+    ("6", "Real WAF lab (ModSecurity CRS via podman)"),
+    ("7", "Help / examples"),
+    ("0", "Exit"),
+]
+
+
+def _menu_lines(width, height):
+    lines = []
+    banner = BANNER.strip("\n").splitlines()
+    if width >= 70 and height >= len(banner) + len(MENU_OPTIONS) + 8:
+        for line in banner:
+            lines.append(line.center(width))
+        lines.append(("stdlib 403/WAF sweep engine  v%s" % VERSION).center(width))
+        lines.append(("raw HTTP/1.1 + h2/HPACK | impact oracle | findings")
+                     .center(width))
+        lines.append("")
+    else:
+        lines.append(("WAF403x v%s" % VERSION).center(width))
+        lines.append("")
+    lines.append("  MENU")
+    for key, label in MENU_OPTIONS:
+        for wrapped in textwrap.wrap("  %s) %s" % (key, label),
+                                      width=max(24, width - 2)):
+            lines.append(wrapped)
+    lines.append("")
+    return lines[:max(8, height - 2)]
+
+
+def _alt_enter():
+    """Switch to the alternate screen so the UI never enters scrollback."""
+    if not sys.stdout.isatty():
+        return False
+    sys.stdout.write("\033[?1049h\033[2J\033[3J\033[H")
+    sys.stdout.flush()
+    return True
+
+
+def _alt_leave(active):
+    if active:
+        sys.stdout.write("\033[2J\033[H\033[?1049l")
+        sys.stdout.flush()
+
+
+def _draw_menu():
+    width, height = shutil.get_terminal_size((100, 30))
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.write("\n".join(_menu_lines(width, height)) + "\n")
+    sys.stdout.flush()
+
+
+def _menu_action(choice, args):
+    if choice == "1":
+        url = _ask("target URL", args.url or "")
+        if not url:
+            print("[x] empty URL")
+            return True
+        args.url = url
+        args.mode = _ask("mode (path/header/method/body/encoding/cookie/"
+                         "ctype/size/all)", args.mode)
+        if args.mode not in MODE_CHOICES:
+            print("[x] unknown mode")
+            return True
+        print(LEVEL_HELP)
+        lvl = _ask("level 1-4 (see above)", str(args.level))
+        args.level = int(lvl) if lvl in ("1", "2", "3", "4") else 4
+        rep = _ask("repeat", str(args.repeat))
+        args.repeat = int(rep) if rep.isdigit() else 2
+        data, code = run(args)
+        if data:
             print()
-            print("  CRS lab steps (macOS/podman):")
-            print("    podman machine start")
-            print("    printf 'SecRule REQUEST_URI \"@beginsWith /users\" "
-                  "\"id:900001,phase:1,deny,status:403,log\"\\n' > "
-                  "~/wafbypass-crs.conf")
-            print("    python3 tests/sim_waf.py --host 0.0.0.0 &")
-            print("    podman run -d --name crs -p 8080:8080 -v "
-                  "\"$HOME/wafbypass-crs.conf:/etc/modsecurity.d/zz-custom.conf:ro\" \\")
-            print("      -e BACKEND=http://host.containers.internal:8099 "
-                  "-e PORT=8080 -e MODSEC_RULE_ENGINE=on \\")
-            print("      -e PARANOIA=1 -e BLOCKING_PARANOIA=1 "
-                  "owasp/modsecurity-crs:nginx")
-            print("    python3 wafbypass.py -u http://127.0.0.1:8080/users "
-                  "--mode path --level 2 -t 2 --repeat 2")
-            print()
-            _ask("Enter to return")
-        elif choice == "7":
-            print()
-            print("  Contoh:")
-            print("    wafbypass.py -u https://t/users --mode path --level 2")
-            print("    wafbypass.py -u 'https://t/search?q=1' --preset sqli "
-                  "--mode encoding")
-            print("    wafbypass.py -u https://t/ --http2 chrome --mode h2")
-            print("    wafbypass.py -u https://t/ --solve-challenge --follow 2")
-            print("    wafbypass.py -u https://t/ --watch 60")
-            print("    wafbypass.py -i          # shell interaktif")
-            print("    wafbypass.py --help")
-            print()
-            _ask("Enter to return")
+            print(render(data, args.json, term_width()))
         else:
-            print("[x] no such option\n")
+            print("[x] run failed (exit %d)" % code)
+        return True
+    if choice == "2":
+        url = _ask("target URL")
+        if not url:
+            print("[x] empty URL")
+            return True
+        args.url = url
+        args.mode = "h2"
+        args.http2 = _ask("h2 profile (chrome/firefox/safari/nghttp2/plain)",
+                          "chrome")
+        if args.http2 not in h2.PROFILES:
+            args.http2 = "chrome"
+        data, code = run(args)
+        if data:
+            print()
+            print(render(data, args.json, term_width()))
+        else:
+            print("[x] run failed (exit %d)" % code)
+        return True
+    if choice == "3":
+        url = _ask("target URL")
+        if not url:
+            print("[x] empty URL")
+            return True
+        args.url = url
+        args.solve_challenge = True
+        args.cookies = True
+        args.follow = 2
+        print("[i] solving in a browser, 2-5 minutes; cookie cache TTL 900 s...")
+        data, code = run(args)
+        if data:
+            print()
+            print(render(data, args.json, term_width()))
+        else:
+            print("[x] run failed (exit %d)" % code)
+        return True
+    if choice == "4":
+        url = _ask("target URL")
+        if not url:
+            print("[x] empty URL")
+            return True
+        args.url = url
+        interval = _ask("interval seconds", "60")
+        watch(args, int(interval) if interval.isdigit() else 60)
+        return True
+    if choice == "5":
+        repl(args)
+        return True
+    if choice == "6":
+        print()
+        print("  CRS lab steps (macOS/podman):")
+        print("    podman machine start")
+        print("    printf 'SecRule REQUEST_URI \"@beginsWith /users\" "
+              "\"id:900001,phase:1,deny,status:403,log\"\\n' > "
+              "~/wafbypass-crs.conf")
+        print("    python3 tests/sim_waf.py --host 0.0.0.0 &")
+        print("    podman run -d --name crs -p 8080:8080 -v "
+              "\"$HOME/wafbypass-crs.conf:/etc/modsecurity.d/zz-custom.conf:ro\" \\")
+        print("      -e BACKEND=http://host.containers.internal:8099 "
+              "-e PORT=8080 -e MODSEC_RULE_ENGINE=on \\")
+        print("      -e PARANOIA=1 -e BLOCKING_PARANOIA=1 "
+              "owasp/modsecurity-crs:nginx")
+        print("    python3 wafbypass.py -u http://127.0.0.1:8080/users "
+              "--mode path --level 2 -t 2 --repeat 2")
+        print()
+        return True
+    if choice == "7":
+        print()
+        print("  Examples:")
+        print("    wafbypass.py -u https://t/users --mode path --level 2")
+        print("    wafbypass.py -u 'https://t/search?q=1' --preset sqli "
+              "--mode encoding")
+        print("    wafbypass.py -u https://t/ --http2 chrome --mode h2")
+        print("    wafbypass.py -u https://t/ --solve-challenge --follow 2")
+        print("    wafbypass.py -u https://t/ --watch 60")
+        print("    wafbypass.py -i          # interactive shell")
+        print("    wafbypass.py --help")
+        print()
+        return True
+    print("[x] no such option")
+    return True
+
+
+def welcome_menu(args):
+    full = _alt_enter()
+    if full:
+        def on_resize(signum, frame):
+            _draw_menu()
+            sys.stdout.write("select menu [1]: ")
+            sys.stdout.flush()
+
+        try:
+            signal.signal(signal.SIGWINCH, on_resize)
+        except (ValueError, OSError):
+            pass
+    printed = False
+    try:
+        while True:
+            if full:
+                _draw_menu()
+            elif not printed:
+                _print_banner()
+                for key, label in MENU_OPTIONS:
+                    print("  %s) %s" % (key, label))
+                print()
+                printed = True
+            choice = _ask("select menu", "1")
+            if choice is None or choice == "0":
+                print("bye.")
+                return 0
+            _menu_action(choice, args)
+            if full:
+                _ask("Enter to return to menu")
+    finally:
+        _alt_leave(full)
 
 
 def main(argv=None):

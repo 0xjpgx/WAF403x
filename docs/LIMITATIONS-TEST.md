@@ -237,7 +237,10 @@ waf403x> run
 waf403x> quit
 ```
 
-The menu is fully English and prints the level table before asking:
+The menu runs in the terminal alternate screen: it clears on entry, on every
+action and on exit, so switching menus cannot duplicate the banner in
+scrollback. `--watch` uses the same alternate screen. The menu is fully
+English and prints the level table before asking:
 `1 obvious rewrite`, `2 one parser differential`, `3 double layer`,
 `4 null/terminal framing`. Interactive `levels` prints the same table.
 

@@ -60,7 +60,9 @@ python3 wafbypass.py -i         # interactive shell, no restart between scans
 python3 wafbypass.py -u URL --watch 60
 ```
 
-The menu prompts for URL, mode, level and repeat. Before the level prompt it
+The menu runs in the alternate screen (no scrollback, no duplicated banner
+after each action) and redraws on resize. It prompts for URL, mode, level and
+repeat. Before the level prompt it
 prints what each level adds (1 obvious rewrite, 2 single parser differential,
 3 double layer, 4 null/terminal framing), then prints the same report as the
 CLI. `-i` keeps the process (and the cookie jar / solved challenge)
