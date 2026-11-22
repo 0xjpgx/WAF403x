@@ -1,6 +1,6 @@
 # WAF behaviour matrix — where each engine inspects, what a block looks like, and what shape assumptions break
 
-Desk research for the 403 sweep engine in `wafdetect.py`. Every row ends in a request shape and a differential signal the engine can assert on. No payloads were sent at third-party sites; everything below is vendor documentation, published research, or a header/body observation on a public page fetched 2026-11-22.
+Desk research for the 403 sweep engine in `tools/wafdetect.py`. Every row ends in a request shape and a differential signal the engine can assert on. No payloads were sent at third-party sites; everything below is vendor documentation, published research, or a header/body observation on a public page fetched 2026-11-22.
 
 Evidence tags used inline:
 
@@ -137,7 +137,7 @@ Generic encoding/obfuscation classes (multiple encodings, overlong UTF-8, `%u`, 
 | Block signature | 403 block page naming Barracuda, cookie `barra_counter_session` (long-lived counter cookie used to correlate requests) `[obs]`/`?`; body text varies with branding `?`. |
 | Weak spots | (a) `barra_counter_session` is a stateful marker: requests that omit it mid-session can be treated as new clients, which changes scoring `?`. (b) Custom error pages make name-based detection unreliable `?`. (c) Body parser coverage undocumented publicly `?`. |
 | Test | First request without any cookie, then the same URL with `Cookie: barra_counter_session=` empty vs a captured valid value. Signal: different status/body between the three = state-dependent decision; then run the multipart boundary-continuation payload against the variant that passed. |
-| Source | detector signature set in `wafdetect.py` (`barra_counter_session`, body "Barracuda") |
+| Source | detector signature set in `tools/wafdetect.py` (`barra_counter_session`, body "Barracuda") |
 
 ## 12. Azure Front Door WAF
 

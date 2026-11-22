@@ -142,9 +142,19 @@ the size family. The `header` family already carries the usual trust headers
 
 ## Tests
 
-`TEST-REPORT.md` contains the verbatim transcript of runs A-H, the 10-profile
-size matrix, failure-path checks, `py_compile` output and traceback greps.
-`sim_waf.py` is the local mock WAF/app used by those runs (127.0.0.1:8099).
+`docs/TEST-REPORT.md` contains the verbatim transcript of runs A-H, the
+10-profile size matrix, failure-path checks, `py_compile` output and
+traceback greps. `tests/sim_waf.py` is the local mock WAF/app used by those
+runs (127.0.0.1:8099).
+
+## Layout
+
+```
+wafbypass.py        sweep engine (the tool)
+tools/wafdetect.py  WAF fingerprint helper
+tests/sim_waf.py    mock WAF + app on 127.0.0.1:8099
+docs/               transcripts and vendor behaviour research
+```
 
 ## License
 

@@ -6,6 +6,10 @@ Work dir: /Users/0xjpg/tools/wafbypass
 Files under test: `wafbypass.py` (engine), `sim_waf.py` (mock WAF + app, 127.0.0.1:8099)
 `wafdetect.py` was not touched.
 
+> Path note (2026-11-22): `sim_waf.py` now lives at `tests/sim_waf.py`,
+> `wafdetect.py` at `tools/wafdetect.py`; transcripts below keep the
+> original invocation paths.
+
 Every block below is copied verbatim from the run, including exit codes.
 
 ## 1. Syntax check

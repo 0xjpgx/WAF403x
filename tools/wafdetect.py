@@ -5,9 +5,9 @@ Fetches a URL, inspects status/headers/cookies/body for known WAF markers,
 then (optional) sends one benign trigger payload and compares.
 
 Usage:
-  python3 wafdetect.py https://example.com
-  python3 wafdetect.py -f hosts.txt --no-probe
-  python3 wafdetect.py https://example.com --json
+  python3 tools/wafdetect.py https://example.com
+  python3 tools/wafdetect.py -f hosts.txt --no-probe
+  python3 tools/wafdetect.py https://example.com --json
 """
 import argparse
 import http.client
