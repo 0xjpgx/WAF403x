@@ -127,11 +127,13 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
         return self.rfile.read(n) if n > 0 else b""
 
-    def _send(self, code, body, reason):
+    def _send(self, code, body, reason, extra=None):
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
+        for key, value in (extra or ()):
+            self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -209,6 +211,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(403, BLOCKED, reason)
             return
         norm = normalize(path)
+        if norm == "/challenge":
+            self._send(403,
+                       b"<html><title>Just a moment...</title>"
+                       b"<body>Checking your browser before accessing</body></html>",
+                       "challenge", extra=[("cf-mitigated", "challenge")])
+            return
+        if norm == "/redirect":
+            self._send(302, b"redirecting", "redirect",
+                       extra=[("Location", "/admin"),
+                              ("Set-Cookie", "minted=1; Path=/; HttpOnly")])
+            return
         if path.startswith("/flaky") or norm == "/flaky":
             self.flaky()
             return

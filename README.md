@@ -1,5 +1,13 @@
 # wafbypass
 
+```
+___       ______________________ ________________
+__ |     / /__    |__  ____/_  // /_  __ \_|__  /___  __
+__ | /| / /__  /| |_  /_   _  // /_  / / /__/_ <__  |/_/
+__ |/ |/ / _  ___ |  __/   /__  __/ /_/ /____/ /__>  <
+____/|__/  /_/  |_/_/        /_/  \____/ /____/ /_/|_|
+```
+
 Stdlib-only 403/WAF bypass sweep engine. It builds raw HTTP/1.1 request bytes
 by hand and writes them to a socket, so `%2e`, `//`, `..;/`, `%00`, backslashes
 and duplicate headers reach the WAF/origin exactly as typed. No `requests`, no
@@ -19,7 +27,17 @@ python3 wafbypass.py -u https://target/submit --mode size --profile cloudflare \
 |---|---|---|
 | `-u/--url` | required | target URL (the only host ever contacted) |
 | `--level` | `4` | escalation cap: 1 obvious rewrite, 2 single differential, 3 double layer, 4 null framing/size |
-| `--mode` | `all` | `path`, `header`, `method`, `body`, `encoding`, `cookie`, `ctype`, `size`, `all` |
+| `--mode` | `all` | `path`, `header`, `method`, `body`, `encoding`, `cookie`, `ctype`, `size`, `h2`, `all` |
+| `--http2` | `off` | send every request as h2 (ALPN `h2`) with profile `chrome`, `firefox`, `safari`, `nghttp2` or `plain` |
+| `--follow` | `0` | follow up to N same-host redirects |
+| `--cookies` | off | keep a Set-Cookie jar for the whole run |
+| `--max-body` | 1048576 | response body cap in bytes |
+| `--ciphers` | OpenSSL default | cipher list passed to `SSLContext.set_ciphers` |
+| `--tls-min` / `--tls-max` | OpenSSL default | TLS version floor/ceiling (`TLSv1_2`, `TLSv1_3`, ...) |
+| `--alpn` | none | ALPN protocol for the h1 transport (`http/1.1`, `h2`) |
+| `--solve-challenge` | off | mint Cloudflare cookies with a stealth browser, then reuse them |
+| `--solver-python` | `./.venv/bin/python` | interpreter that has `scrapling` installed |
+| `--solver-timeout` | 120 | seconds allowed for the browser challenge |
 | `--profile` | `generic` | vendor size limits (table below) |
 | `--param` | `q` | query parameter replaced or appended |
 | `--payload` | `' OR 1=1--` | literal payload |
@@ -46,6 +64,7 @@ on the same host, used as the soft-404 signature.
 | `ERROR` | no response |
 | `BLOCKED` | same status as baseline and body similarity >= 0.95 |
 | `NOTFOUND` | same status as control and body similarity >= 0.90 |
+| `CHALLENGE` | JS/CAPTCHA interstitial (`cf-mitigated`, "Just a moment", Turnstile, hCaptcha, ...) |
 | `BYPASS` | 2xx/3xx, non-empty body, similarity to baseline < 0.90, not control |
 | `DIFF` | anything else |
 | `UNSTABLE` | a BYPASS/DIFF candidate that changed status or body hash on re-send |
@@ -120,23 +139,73 @@ the size family. The `header` family already carries the usual trust headers
   boundary), text/plain: parser differential.
 * `size` - payload at offset `L-16` vs offset 0, per profile limits.
 
+* `h2` - same request replayed under browser fingerprints: pseudo-header
+  order (Chrome/Firefox/Safari), SETTINGS profile, PRIORITY tree on/off.
+  Needs `--http2 <profile>`; each variant opens its own connection.
+
+## HTTP/2
+
+`--http2 chrome|firefox|safari|nghttp2|plain` switches every request to h2:
+cleartext prior knowledge for `http://`, ALPN `h2` for `https://`. It is a
+hand-written frame layer plus HPACK in `h2.py` (stdlib only), not a library.
+
+Controllable fingerprint inputs:
+
+| Knob | Values |
+|---|---|
+| SETTINGS entries + order | per profile (Chrome: header table 64K, push 0, 1000 streams, window 6 MB, header list 256K) |
+| connection WINDOW_UPDATE | Chrome 15663105, Firefox 12517377, Safari 10420225, nghttp2 33554432 |
+| PRIORITY frames | Chrome-style linear tree on streams 3..15 |
+| pseudo-header order | `:method,:authority,:scheme,:path` (Chrome) or Firefox/Safari variants |
+| HPACK string style | raw literals (RFC-legal, no Huffman decode dependency) |
+
+Still not reproducible: exact HPACK indexing decisions, TLS extension order
+(see below), and frame timing. The `h2` mode varies order/profile/priority so
+a gate keyed on one of those inputs shows up as a status or body difference.
+
+## Challenge solving
+
+`--solve-challenge` runs `challenge.py` under the solver venv with
+`scrapling.fetchers.StealthySession(solve_cloudflare=True)` (patchright
+Chromium + stealth patches). The worker returns cookies plus the browser's
+`navigator.userAgent`; both are injected into every raw request of the run.
+Setup:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install "scrapling[fetchers]"
+.venv/bin/patchright install chromium
+```
+
+A `CHALLENGE` verdict is never counted as a bypass. `--solve-challenge`
+either clears the interstitial (baseline then answers the app) or fails
+loudly with the browser error. `cf_clearance` is bound to the origin, the
+user agent and usually the client IP; the engine reuses the same UA, so only
+the TLS/HTTP fingerprint differs from the browser.
+
+## Redirects, cookies, caps
+
+`--follow N` chases up to N same-host redirects (cross-host targets are
+dropped), rewriting POST to GET on 301/302/303 and preserving method+body on
+307/308. `--cookies` keeps a per-run Set-Cookie jar, which is also what a
+minted challenge cookie needs. `--max-body BYTES` raises or lowers the
+response cap from the default 1 MiB.
+
 ## Limitations
 
-* **HTTP/2 fingerprinting is NOT implemented.** Everything goes out as raw
-  HTTP/1.1; no H2 preface, SETTINGS frame order, window size, priority tree or
-  pseudo-header order is generated. Akamai/Cloudflare/CloudFront H2
-  fingerprint gates cannot be evaluated with this tool.
-* No TLS fingerprinting (JA3/JA4) and no TLS extension ordering control; the
-  stdlib `ssl` context is unverified and otherwise default.
-* No JavaScript challenge solving, CAPTCHA handling, cookie minting or
-  redirect following. A 403 challenge page is reported as `BLOCKED`, not
-  bypassed.
-* Response bodies are read up to 1 MB; headers up to 64 KB.
-* Classification is body-similarity based. A site that returns the same 200
-  body for every path can mask real differences, and the `size` family is
-  capped by the largest profile limit (1 MB for `cloudflare`).
-* Only the URL given is contacted (plus a random control path on the same
-  host). No crawling, no DNS tricks, no third-party hosts.
+* TLS extension order and TLS 1.3 cipher selection are not controllable with
+  the stdlib `ssl` module (OpenSSL fixes both); `--ciphers`, `--tls-min`,
+  `--tls-max` and `--alpn` change the cipher list, version and ALPN only, so
+  a full JA3/JA4 match is impossible without vendoring a TLS stack.
+* CAPTCHA solving is delegated to the stealth browser; pure-image CAPTCHAs
+  are not solved by the engine itself.
+* Response bodies are capped by `--max-body` (1 MiB default); headers by 64 KB.
+* Classification is body-similarity based. `[!] soft-404 masking` is printed
+  when the control page matches the baseline, because then DIFF rows are not
+  evidence.
+* Only the given URL is contacted (plus one random control path on the same
+  host) and, with `--follow`/`--solve-challenge`, the redirect and solver hops
+  derived from it. No crawling, no DNS tricks, no third-party hosts.
 * The engine sends POST bodies in `body`/`ctype`/`size` modes, which can have
   side effects on a live target; point it at staging or a throwaway path.
 
@@ -144,16 +213,22 @@ the size family. The `header` family already carries the usual trust headers
 
 `docs/TEST-REPORT.md` contains the verbatim transcript of runs A-H, the
 10-profile size matrix, failure-path checks, `py_compile` output and
-traceback greps. `tests/sim_waf.py` is the local mock WAF/app used by those
-runs (127.0.0.1:8099).
+traceback greps. `docs/LIMITATIONS-TEST.md` covers the HTTP/2, redirect,
+cookie, challenge, cap and TLS work with the screenshots in
+`docs/screenshots/`. `tests/sim_waf.py` (h1) and `tests/sim_h2.py` (h2c) are
+the local mocks used by those runs.
 
 ## Layout
 
 ```
-wafbypass.py        sweep engine (the tool)
-tools/wafdetect.py  WAF fingerprint helper
-tests/sim_waf.py    mock WAF + app on 127.0.0.1:8099
-docs/               transcripts and vendor behaviour research
+wafbypass.py         sweep engine (the tool)
+h2.py                HTTP/2 + HPACK client used by --http2
+challenge.py         stealth-browser cookie minting (--solve-challenge)
+tools/wafdetect.py   WAF fingerprint helper
+tools/shot.py        transcript -> PNG renderer for docs/screenshots
+tests/sim_waf.py     mock h1 WAF + app (127.0.0.1:8099)
+tests/sim_h2.py      mock h2c WAF + app (127.0.0.1:8098)
+docs/                transcripts, limitation matrix, screenshots
 ```
 
 ## License
