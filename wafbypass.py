@@ -47,6 +47,10 @@ import subprocess
 import sys
 import textwrap
 import threading
+try:
+    import readline  # noqa: F401  (arrow keys/history; no caret escapes)
+except ImportError:
+    readline = None
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlsplit
