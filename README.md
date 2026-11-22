@@ -179,8 +179,10 @@ python3 -m venv .venv
 
 A `CHALLENGE` verdict is never counted as a bypass. `--solve-challenge`
 either clears the interstitial (baseline then answers the app) or fails
-loudly with the browser error. `cf_clearance` is bound to the origin, the
-user agent and usually the client IP; the engine reuses the same UA, so only
+loudly with the browser error. A solve takes 2-5 minutes; the jar is cached
+in `~/.cache/wafbypass/<netloc>.json` for 900 s, and `--solver-refresh`
+forces a new browser run. `cf_clearance` is bound to the origin, the user
+agent and usually the client IP; the engine reuses the browser UA, so only
 the TLS/HTTP fingerprint differs from the browser.
 
 ## Redirects, cookies, caps

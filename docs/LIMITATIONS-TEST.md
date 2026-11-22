@@ -88,25 +88,42 @@ Screenshot: `screenshots/6-h2-real.png`.
 
 ## 7. Cloudflare challenge solve + cookie reuse
 
-Solver worker (Scrapling stealth browser):
+Solver worker (Scrapling stealth browser, real run):
 
 ```
-$ .venv/bin/python challenge.py https://nopecha.com/demo/cloudflare 200
-{"cookies": {"cf_clearance": "Ck8uh...", "_gcl_au": "...", ...},
+$ .venv/bin/python challenge.py https://nopecha.com/demo/cloudflare 300
+{"cookies": {"cf_clearance": "Ck8uhGTK...", "_gcl_au": "...", "_ga": "...", ...},
  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ... Chrome/156.0.0.0 Safari/537.36",
  "status": 200, "final_url": "https://nopecha.com/demo", "title": "NopeCHA - CAPTCHA Demo",
  "challenge": false, "error": null}
 ```
 
-Engine end-to-end run (`--solve-challenge` injects those cookies + UA into raw
-requests):
+Without the solver, the same URL is a challenge and is labelled as such:
 
 ```
-$ python3 wafbypass.py -u https://nopecha.com/demo/cloudflare --solve-challenge --follow 2 --mode path --level 1 -t 2 --timeout 20 --repeat 1 --solver-timeout 240
+$ python3 wafbypass.py -u https://nopecha.com/demo/cloudflare --follow 2 --mode path --level 1 -t 2 --timeout 20 --repeat 1
+[*] baseline GET /demo/cloudflare -> 403 / 5717 bytes  "<!DOCTYPE html><html lang="en-US"><head><title>Just a moment..."
+[!] baseline is a JS/CAPTCHA challenge (cf-mitigated); rerun with --solve-challenge to mint cookies in a browser
+path      double-slash           GET    403     5717   CHALLENGE ...
+[+] SUMMARY variants=4 bypass=0 blocked=0 notfound=2 diff=0 error=0 unstable=0 challenge=2
 ```
 
-Result recorded in `screenshots/7-solver-e2e.png` (see the `challenge solver`
-and `baseline` lines of that transcript).
+With the solver, the minted cookies + UA are injected into raw requests:
+
+```
+$ python3 wafbypass.py -u https://nopecha.com/demo/cloudflare --solve-challenge --follow 2 --mode path --level 1 -t 2 --timeout 20 --repeat 1
+[*] transport h1 follow=2 cookies=True
+[*] challenge solver cookies=6 status=200 title='NopeCHA - CAPTCHA Demo' solved=True
+[*] baseline GET /demo/cloudflare -> 200 / 142880 bytes
+[+] SUMMARY variants=4 bypass=0 blocked=4 notfound=0 diff=0 error=0 unstable=0 challenge=0
+```
+
+A full solve takes 2-5 minutes; `challenge.py` caches the jar in
+`~/.cache/wafbypass/<netloc>.json` for 900 s, so the engine run above starts
+from the cached clearance and finishes in seconds. `--solver-refresh` forces
+a new browser solve.
+
+Screenshots: `screenshots/7a-no-solver.png`, `screenshots/7-solver-e2e.png`.
 
 ## 8. TLS knobs (real host)
 
