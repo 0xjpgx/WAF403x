@@ -1,11 +1,11 @@
 # WAF403x
 
 ```
-___       ______________________ ________________
-__ |     / /__    |__  ____/_  // /_  __ \_|__  /___  __
-__ | /| / /__  /| |_  /_   _  // /_  / / /__/_ <__  |/_/
-__ |/ |/ / _  ___ |  __/   /__  __/ /_/ /____/ /__>  <
-____/|__/  /_/  |_/_/        /_/  \____/ /____/ /_/|_|
+__        ___    _____ _  _    ___ _____
+\ \      / / \  |  ___| || |  / _ \___ /_  __
+ \ \ /\ / / _ \ | |_  | || |_| | | ||_ \ \/ /
+  \ V  V / ___ \|  _| |__   _| |_| |__) >  <
+   \_/\_/_/   \_\_|      |_|  \___/____/_/\_\
 ```
 
 Stdlib-only 403/WAF bypass sweep engine. It builds raw HTTP/1.1 request bytes
@@ -48,6 +48,31 @@ python3 wafbypass.py -u https://target/submit --mode size --profile cloudflare \
 | `--repeat` | 2 | stability re-sends per BYPASS/DIFF candidate |
 | `--json` | off | JSON output |
 | `-o/--out` | none | also write output to a file |
+| `-i/--interactive` | off | shell that stays alive: `url`, `mode`, `level`, `run`, `quit` |
+| `--watch SECONDS` | off | re-run the same scan on an interval until Ctrl-C |
+| `--menu` | auto without `-u` | welcome menu (ASCII banner + numbered actions) |
+
+## Welcome menu and sessions
+
+```
+python3 wafbypass.py            # banner + menu: scan, h2, challenge, watch, shell, lab
+python3 wafbypass.py -i         # interactive shell, no restart between scans
+python3 wafbypass.py -u URL --watch 60
+```
+
+The menu prompts for URL, mode, level and repeat. Before the level prompt it
+prints what each level adds (1 obvious rewrite, 2 single parser differential,
+3 double layer, 4 null/terminal framing), then prints the same report as the
+CLI. `-i` keeps the process (and the cookie jar / solved challenge)
+alive: change `url`, `mode`, `level`, `preset`, `payload`, `http2`, `follow`,
+`repeat`, `threads`, `json on|off`, `impact on|off`, then `run`. `--watch`
+clears the screen and re-renders every interval; on terminal resize
+(`SIGWINCH`) both `-i` and `--watch` re-render immediately.
+
+Output adapts to the terminal width read from `COLUMNS`/tty: at 78+ columns a
+single table with a fitted snippet column, below 78 a stacked two-line row
+with wrapped snippets. Findings with identical disclosure are grouped once
+(`N variant(s): ...`) instead of repeated per row.
 
 Baseline is the un-obfuscated attack for the selected mode: raw payload in the
 query for `encoding`/`all`, the canonical urlencoded POST for `body`/`ctype`/
@@ -83,16 +108,23 @@ transform (the impact oracle), which labels the row:
 | `access` | twin is identical: the transform itself skipped the WAF, app output unchanged |
 | `unknown` | transform has no payload (path/header/method/h2) |
 
-Every BYPASS row also gets a `finding` record extracted from the response it
-reached: `<title>`, visible text snippet, counts of emails, 16-digit NIKs and
-Indonesian phone numbers, `href` count, and sensitive markers
-(`password`, `token`, `api_key`, `npwp`, `flag{`, ...). The text report adds a
+Every BYPASS row also gets a filtered `finding`: severity, `<title>`, the
+actual values found (up to 10 emails, phones and 16-digit NIKs with the middle
+of each NIK masked), sensitive markers (`password`, `token`, `api_key`,
+`npwp`, `flag{`, ...), `href` count, and one excerpt centred on the first
+sensitive token. Rows with no PII and no secret collapse to
+`no PII or secrets in the response`. The text report adds a
 `FINDINGS (baseline 403 -> bypass 200)` block, e.g.:
 
 ```
 [+] FINDINGS (baseline 403 -> bypass 200)
-  path      double-slash           403->200 impact=unknown title='User Directory' emails=3 niks=3 phones=3 links=0 sensitive=password,token
-            "User Directory User Directory budi budi.santoso@example.co.id +6281234567890 3274010101900001 ..."
+  severity=high title='User Directory' variants=10
+    variants: path/double-slash, path/dot-segment, path/pct-dot, path/semicolon-suffix, path/trailing-dot, path/trailing-slash, +4 more
+    emails  : andi.pratama@example.co.id, budi.santoso@example.co.id, sari.wulandari@example.co.id
+    phones  : +6281234567890, +6281298765432, +6281311122233
+    niks    : 327401****0001, 327401****0002, 327401****0003
+    secrets : password, token
+    excerpt: "password reset token: a1b2c3"
 ```
 
 That is the deliverable of a bypass: status transition plus the information

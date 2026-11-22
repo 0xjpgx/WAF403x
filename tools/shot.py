@@ -9,7 +9,7 @@ width = int(sys.argv[3]) if len(sys.argv) > 3 else 1180
 text = open(src, encoding="utf-8", errors="replace").read().rstrip("\n")
 doc = (
     "<html><body style=\"margin:0;background:#0b0f14;color:#e6edf3;"
-    "font:12.5px/1.5 Menlo,monospace;padding:18px\">"
+    "font:15px/1.45 Menlo,monospace;padding:20px\">"
     "<pre style=\"margin:0;white-space:pre-wrap\">%s</pre></body></html>"
     % html.escape(text)
 )

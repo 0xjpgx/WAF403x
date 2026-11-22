@@ -136,8 +136,13 @@ $ python3 wafbypass.py -u http://127.0.0.1:8099/users --mode path --level 2 -t 2
 [+] SUMMARY variants=13 bypass=10 blocked=0 notfound=3 diff=0 error=0 unstable=0 challenge=0
 [i] impact: payload=0 access=0 unknown=10
 [+] FINDINGS (baseline 403 -> bypass 200)
-  path      double-slash           403->200 impact=unknown title='User Directory' emails=3 niks=3 phones=3 links=0 sensitive=password,token
-            "User Directory User Directory budi budi.santoso@example.co.id +6281234567890 3274010101900001 ..."
+  severity=high title='User Directory' variants=10
+    variants: path/double-slash, path/dot-segment, path/pct-dot, path/semicolon-suffix, path/trailing-dot, path/trailing-slash, +4 more
+    emails  : andi.pratama@example.co.id, budi.santoso@example.co.id, sari.wulandari@example.co.id
+    phones  : +6281234567890, +6281298765432, +6281311122233
+    niks    : 327401****0001, 327401****0002, 327401****0003
+    secrets : password, token
+    excerpt: "password reset token: a1b2c3"
 ```
 
 The JSON form carries the same data per row:
@@ -183,8 +188,13 @@ $ python3 wafbypass.py -u http://127.0.0.1:8080/users --mode path --level 2 -t 2
 [+] SUMMARY variants=13 bypass=8 blocked=0 notfound=3 diff=2 error=0 unstable=0 challenge=0
 [i] stability: 10/10 confirmed
 [+] FINDINGS (baseline 403 -> bypass 200)
-  path      double-slash           403->200 impact=unknown title='User Directory' emails=3 niks=3 phones=3 links=0 sensitive=password,token
-            "User Directory User Directory budi budi.santoso@example.co.id +6281234567890 3274010101900001 ..."
+  severity=high title='User Directory' variants=10
+    variants: path/double-slash, path/dot-segment, path/pct-dot, path/semicolon-suffix, path/trailing-dot, path/trailing-slash, +4 more
+    emails  : andi.pratama@example.co.id, budi.santoso@example.co.id, sari.wulandari@example.co.id
+    phones  : +6281234567890, +6281298765432, +6281311122233
+    niks    : 327401****0001, 327401****0002, 327401****0003
+    secrets : password, token
+    excerpt: "password reset token: a1b2c3"
 ```
 
 Real WAF, real 403 -> 200 transition, and the disclosed data is reported as
@@ -212,6 +222,56 @@ response changed, yet the finding shows `emails=0 niks=0 phones=0
 sensitive=-`: a WAF signature gap without an exploit.
 
 Screenshot: `screenshots/10-crs-echo.png`.
+
+## 13. Welcome menu, interactive shell, responsive output
+
+```
+$ python3 wafbypass.py          # no args: banner + numbered menu
+$ printf '0\n' | COLUMNS=100 python3 wafbypass.py
+$ python3 wafbypass.py -i       # stays alive
+waf403x> url http://127.0.0.1:8099/users
+waf403x> mode path
+waf403x> level 1
+waf403x> repeat 1
+waf403x> run
+waf403x> quit
+```
+
+The menu is fully English and prints the level table before asking:
+`1 obvious rewrite`, `2 one parser differential`, `3 double layer`,
+`4 null/terminal framing`. Interactive `levels` prints the same table.
+
+`--watch 1` on the same target produced five rendered frames in five seconds
+(`timeout 5 ... ; grep -c FINDINGS` -> 5), each frame cleared and redrawn.
+
+Width handling, same target:
+
+```
+$ COLUMNS=64  python3 wafbypass.py -u .../users --mode path --level 1 --repeat 1
+MODE/VARIANT          METHOD STATUS BYTES VERDICT
+path/double-slash GET 200 478 BYPASS
+  "<html><head><title>User
+  Directory</title></head><body><h1>Us..."
+
+$ COLUMNS=130 python3 wafbypass.py -u .../users --mode path --level 1 --repeat 1
+MODE      VARIANT                      METHOD STATUS BYTES   VERDICT   SNIPPET
+path      double-slash                 GET    200    478     BYPASS    <html>...
+...
+[+] FINDINGS (baseline 403 -> bypass 200)
+  severity=high title='User Directory' variants=3
+    variants: path/double-slash, path/dot-segment, path/trailing-slash
+    emails  : andi.pratama@example.co.id, budi.santoso@example.co.id, sari.wulandari@example.co.id
+    phones  : +6281234567890, +6281298765432, +6281311122233
+    niks    : 327401****0001, 327401****0002, 327401****0003
+    secrets : password, token
+    excerpt: "password reset token: a1b2c3"
+```
+
+Findings with identical disclosure are collapsed into one grouped block; the
+snippet wraps to the terminal width.
+
+Screenshots: `screenshots/12-menu.png`, `screenshots/13-interactive.png`,
+`screenshots/14-responsive.png`.
 
 ## Residual gaps
 

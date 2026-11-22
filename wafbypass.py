@@ -38,11 +38,14 @@ import json
 import os
 import random
 import re
+import shutil
+import signal
 import socket
 import ssl
 import string
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -62,11 +65,12 @@ UA_GOOGLEBOT = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/b
 
 VERSION = "0.2.0"
 BANNER = r"""
-___       ______________________ ________________
-__ |     / /__    |__  ____/_  // /_  __ \_|__  /___  __
-__ | /| / /__  /| |_  /_   _  // /_  / / /__/_ <__  |/_/
-__ |/ |/ / _  ___ |  __/   /__  __/ /_/ /____/ /__>  <
-____/|__/  /_/  |_/_/        /_/  \____/ /____/ /_/|_|
+██╗    ██╗ █████╗ ███████╗██╗  ██╗ ██████╗ ██████╗ ██╗  ██╗
+██║    ██║██╔══██╗██╔════╝██║  ██║██╔═████╗╚════██╗╚██╗██╔╝
+██║ █╗ ██║███████║█████╗  ███████║██║██╔██║ █████╔╝ ╚███╔╝
+██║███╗██║██╔══██║██╔══╝  ╚════██║████╔╝██║ ╚═══██╗ ██╔██╗
+╚███╔███╔╝██║  ██║██║          ██║╚██████╔╝██████╔╝██╔╝ ██╗
+ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝          ╚═╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝
 """
 
 PRESETS = {
@@ -508,8 +512,33 @@ FINDING_MARKERS = (b"admin", b"dashboard", b"user list", b"users",
                    b"confidential", b"internal", b"private", b"flag{")
 
 
+def _mask_nik(value):
+    text = value.decode("latin-1", "replace")
+    if len(text) != 16:
+        return text
+    return text[:6] + "****" + text[-4:]
+
+
+def _pick_excerpt(text, title, needles):
+    """One line of context around the first sensitive token, title stripped."""
+    low = text.lower()
+    for needle in needles:
+        if not needle:
+            continue
+        pos = low.find(needle.lower())
+        if pos >= 0:
+            start = max(0, pos - 50)
+            boundary = text.rfind(" ", start, pos)
+            if boundary >= 0:
+                start = boundary + 1
+            return " ".join(text[start:start + 150].split())
+    if title and text.startswith(title):
+        text = text[len(title):].strip()
+    return " ".join(text[:140].split())
+
+
 def finding(resp):
-    """What a bypassed response exposes: title, text, PII-ish counts, markers."""
+    """Filtered disclosure view: values, severity, one context excerpt."""
     body = resp.body
     low = body.lower()
     title = ""
@@ -520,14 +549,37 @@ def finding(resp):
                   flags=re.I | re.S)
     text = re.sub(rb"<[^>]+>", b" ", text)
     text = " ".join(text.decode("utf-8", "replace").split())
+    emails = sorted(set(x.decode("latin-1", "replace")
+                        for x in EMAIL_RE.findall(body)))[:10]
+    phones = sorted(set(x.decode("latin-1", "replace")
+                        for x in PHONE_RE.findall(body)))[:10]
+    raw_niks = sorted(set(NIK_RE.findall(body)))[:10]
+    niks = [_mask_nik(x) for x in raw_niks]
+    sensitive = [m.decode() for m in SENSITIVE if m in low][:8]
+    high_secrets = [m for m in sensitive
+                    if m in ("password", "passwd", "api_key", "apikey",
+                             "secret", "token", "credential", "creditcard",
+                             "flag{")]
+    if raw_niks or high_secrets:
+        severity = "high"
+    elif emails or phones:
+        severity = "medium"
+    else:
+        severity = "low"
+    excerpt = _pick_excerpt(text, title, high_secrets + emails + phones
+                            + [x.decode("latin-1", "replace") for x in raw_niks])
     return {
         "title": title,
-        "snippet": text[:160],
-        "emails": len(set(EMAIL_RE.findall(body))),
-        "niks": len(set(NIK_RE.findall(body))),
-        "phones": len(set(PHONE_RE.findall(body))),
+        "snippet": excerpt,
+        "emails": len(emails),
+        "emails_list": emails,
+        "phones": len(phones),
+        "phones_list": phones,
+        "niks": len(raw_niks),
+        "niks_list": niks,
         "links": len(re.findall(rb"href=", low)),
-        "sensitive": [m.decode() for m in SENSITIVE if m in low][:8],
+        "sensitive": sensitive,
+        "severity": severity,
         "markers": [m.decode() for m in FINDING_MARKERS if m in low][:8],
     }
 
@@ -1112,95 +1164,458 @@ def run(args):
     return data, (0 if counts["BYPASS"] else 1)
 
 
-def render(data, as_json):
+def term_width(default=100):
+    try:
+        return max(40, shutil.get_terminal_size((default, 24)).columns)
+    except OSError:
+        return default
+
+
+def fit(text, width):
+    text = " ".join(str(text).split())
+    if width <= 3 or len(text) <= width:
+        return text[:max(0, width)]
+    return text[:width - 3] + "..."
+
+
+def emit(out, line, width):
+    for i, part in enumerate(textwrap.wrap(line, width=max(20, width)) or [""]):
+        out.append(part if i == 0 else "  " + part)
+
+
+def render_rows(rows, width):
+    out = []
+    if width < 78:
+        out.append("MODE/VARIANT          METHOD STATUS BYTES VERDICT")
+        out.append("-" * min(width, 64))
+        for r in rows:
+            out.append(fit("%s/%s  %s %s %s %s"
+                           % (r["mode"], r["variant"], r["method"],
+                              r["status"], r["bytes"], r["verdict"]), width))
+            if r["snippet"]:
+                for line in textwrap.wrap('"%s"' % r["snippet"],
+                                          width=max(20, width - 2))[:2]:
+                    out.append("  " + line)
+        return out
+    vw = min(28, max(10, width - 62))
+    snap_w = max(12, width - (42 + vw))
+    out.append("%-9s %-*s %-6s %-6s %-7s %-9s %s"
+               % ("MODE", vw, "VARIANT", "METHOD", "STATUS", "BYTES",
+                  "VERDICT", "SNIPPET"))
+    out.append("-" * min(width, 42 + vw + snap_w))
+    for r in rows:
+        out.append("%-9s %-*s %-6s %-6s %-7s %-9s %s"
+                   % (r["mode"], vw, fit(r["variant"], vw), r["method"],
+                      r["status"], r["bytes"], r["verdict"],
+                      fit(r["snippet"], snap_w)))
+    return out
+
+
+def _list(values, limit=3):
+    shown = ", ".join(values[:limit])
+    if len(values) > limit:
+        shown += ", +%d more" % (len(values) - limit)
+    return shown
+
+
+def render_findings(findings, baseline_status, width):
+    groups = []
+    index = {}
+    for row in findings:
+        f = row["finding"]
+        key = (f["severity"], f["title"], tuple(f["emails_list"]),
+               tuple(f["phones_list"]), tuple(f["niks_list"]),
+               tuple(f["sensitive"]), f["snippet"])
+        if key not in index:
+            index[key] = []
+            groups.append((key, index[key]))
+        index[key].append(row)
+    statuses = ",".join(sorted(set(str(r["status"]) for r in findings)))
+    out = ["[+] FINDINGS (baseline %s -> bypass %s)"
+           % (baseline_status, statuses)]
+    for key, rows in groups:
+        severity, title, emails, phones, niks, sensitive, excerpt = key
+        names = ["%s/%s" % (r["mode"], r["variant"]) for r in rows]
+        shown = ", ".join(names[:6])
+        if len(names) > 6:
+            shown += ", +%d more" % (len(names) - 6)
+        head = "  severity=%s title=%r variants=%d" % (severity, title,
+                                                       len(rows))
+        emit(out, head, width)
+        emit(out, "    variants: " + shown, width)
+        if emails:
+            emit(out, "    emails  : %s" % _list(emails), width)
+        if phones:
+            emit(out, "    phones  : %s" % _list(phones), width)
+        if niks:
+            emit(out, "    niks    : %s" % _list(niks), width)
+        if sensitive:
+            emit(out, "    secrets : %s" % ", ".join(sensitive), width)
+        if excerpt and (emails or phones or niks or sensitive):
+            for line in textwrap.wrap('excerpt: "%s"' % excerpt,
+                                      width=max(20, width - 4))[:2]:
+                out.append("    " + line)
+        elif severity == "low":
+            emit(out, "    no PII or secrets in the response", width)
+    return out
+
+
+def render(data, as_json, width=None):
     if as_json:
         return json.dumps(data, indent=2, ensure_ascii=False)
+    width = width or term_width()
     out = []
-    out.append("[*] target   %s   mode=%s   level=%d   param=%s   profile=%s"
-               % (data["url"], data["mode"], data["level"], data["param"],
-                  data["profile"]))
+    emit(out, "[*] target   %s   mode=%s   level=%d   param=%s   profile=%s"
+         % (data["url"], data["mode"], data["level"], data["param"],
+            data["profile"]), width)
     if data["http2"] != "off":
-        out.append("[*] transport h2 (ALPN h2) profile=%s follow=%d cookies=%s"
-                   % (data["http2"], data["follow"], data["cookies"]))
+        emit(out, "[*] transport h2 (ALPN h2) profile=%s follow=%d cookies=%s"
+             % (data["http2"], data["follow"], data["cookies"]), width)
     elif data["follow"] or data["cookies"]:
-        out.append("[*] transport h1 follow=%d cookies=%s"
-                   % (data["follow"], data["cookies"]))
+        emit(out, "[*] transport h1 follow=%d cookies=%s"
+             % (data["follow"], data["cookies"]), width)
     if data.get("challenge"):
         ch = data["challenge"]
-        out.append("[*] challenge solver cookies=%d status=%s title=%r solved=%s"
-                   % (ch["cookies"], ch["status"], ch["title"],
-                      not ch["challenge_page"]))
-    out.append("[*] payload  %s" % data["payload"])
-    out.append("[*] baseline %s %s -> %s / %d bytes  \"%s\""
-               % (data["baseline"]["method"], data["baseline"]["target"],
-                  data["baseline"]["status"], data["baseline"]["bytes"],
-                  data["baseline"]["snippet"]))
+        emit(out, "[*] challenge solver cookies=%d status=%s title=%r solved=%s"
+             % (ch["cookies"], ch["status"], ch["title"],
+                not ch["challenge_page"]), width)
+    emit(out, "[*] payload  %s" % data["payload"], width)
+    emit(out, '[*] baseline %s %s -> %s / %d bytes  "%s"'
+         % (data["baseline"]["method"], data["baseline"]["target"],
+            data["baseline"]["status"], data["baseline"]["bytes"],
+            data["baseline"]["snippet"]), width)
     if not data["baseline"]["blocked"]:
-        out.append("[i] baseline already returns 2xx (nothing is being blocked); "
-                   "BYPASS rows cannot be proven against it")
+        emit(out, "[i] baseline already returns 2xx (nothing is being "
+             "blocked); BYPASS rows cannot be proven against it", width)
     if data["baseline"].get("challenge"):
-        out.append("[!] baseline is a JS/CAPTCHA challenge (%s); rerun with "
-                   "--solve-challenge to mint cookies in a browser"
-                   % data["baseline"]["challenge"])
-    out.append("[*] control  GET -> %s / %d bytes  \"%s\""
-               % (data["control"]["status"], data["control"]["bytes"],
-                  data["control"]["snippet"]))
+        emit(out, "[!] baseline is a JS/CAPTCHA challenge (%s); rerun with "
+             "--solve-challenge to mint cookies in a browser"
+             % data["baseline"]["challenge"], width)
+    emit(out, '[*] control  GET -> %s / %d bytes  "%s"'
+         % (data["control"]["status"], data["control"]["bytes"],
+            data["control"]["snippet"]), width)
     if data["summary"]["masked"]:
-        out.append("[!] soft-404 masking: control and baseline share status and "
-                   "body; DIFF rows are not evidence")
+        emit(out, "[!] soft-404 masking: control and baseline share status "
+             "and body; DIFF rows are not evidence", width)
     out.append("")
-    out.append("%-9s %-22s %-6s %-7s %-6s %-9s %s"
-               % ("MODE", "VARIANT", "METHOD", "STATUS", "BYTES", "VERDICT", "SNIPPET"))
-    out.append("-" * 100)
-    for r in data["rows"]:
-        out.append("%-9s %-22s %-6s %-7s %-6s %-9s %s"
-                   % (r["mode"], r["variant"], r["method"], r["status"],
-                      r["bytes"], r["verdict"], r["snippet"]))
+    out.extend(render_rows(data["rows"], width))
     out.append("")
     s = data["summary"]
     st = s["stability"]
-    out.append("[+] SUMMARY variants=%d bypass=%d blocked=%d notfound=%d diff=%d "
-               "error=%d unstable=%d challenge=%d"
-               % (s["variants"], s["BYPASS"], s["BLOCKED"], s["NOTFOUND"],
-                  s["DIFF"], s["ERROR"], s["UNSTABLE"], s["CHALLENGE"]))
+    emit(out, "[+] SUMMARY variants=%d bypass=%d blocked=%d notfound=%d "
+         "diff=%d error=%d unstable=%d challenge=%d"
+         % (s["variants"], s["BYPASS"], s["BLOCKED"], s["NOTFOUND"],
+            s["DIFF"], s["ERROR"], s["UNSTABLE"], s["CHALLENGE"]), width)
     if s["repeat"]:
         out.append("[i] stability: %d/%d confirmed"
                    % (st["confirmed"], st["retried"]))
-    if s.get("impact"):
-        imp = s["impact"]
-        out.append("[i] impact: payload=%d access=%d unknown=%d "
-                   "(access = transform slipped through, app response unchanged)"
-                   % (imp["payload"], imp["access"], imp["unknown"]))
     else:
         out.append("[i] stability: disabled (--repeat 0)")
+    if s.get("impact"):
+        imp = s["impact"]
+        emit(out, "[i] impact: payload=%d access=%d unknown=%d "
+             "(access = transform slipped through, app response unchanged)"
+             % (imp["payload"], imp["access"], imp["unknown"]), width)
     byp = [r for r in data["rows"] if r["verdict"] == "BYPASS"]
     if byp:
-        out.append("[+] BYPASS rows: " + ", ".join(
-            "%s/%s(%d)" % (r["mode"], r["variant"], r["status"]) for r in byp))
+        emit(out, "[+] BYPASS rows: " + ", ".join(
+            "%s/%s(%d)" % (r["mode"], r["variant"], r["status"]) for r in byp),
+            width)
     else:
         out.append("[+] BYPASS rows: none")
     uns = [r for r in data["rows"] if r["verdict"] == "UNSTABLE"]
     if uns:
-        out.append("[!] UNSTABLE rows: " + ", ".join(
-            "%s/%s(%d)" % (r["mode"], r["variant"], r["status"]) for r in uns))
+        emit(out, "[!] UNSTABLE rows: " + ", ".join(
+            "%s/%s(%d)" % (r["mode"], r["variant"], r["status"]) for r in uns),
+            width)
     findings = [r for r in data["rows"] if r.get("finding")]
     if findings:
         out.append("")
-        out.append("[+] FINDINGS (baseline %s -> bypass %s)"
-                   % (data["baseline"]["status"],
-                      ",".join(sorted(set(str(r["status"]) for r in findings)))))
-        for r in findings:
-            f = r["finding"]
-            out.append("  %-9s %-22s %s->%d impact=%s title=%r emails=%d niks=%d "
-                       "phones=%d links=%d sensitive=%s"
-                       % (r["mode"], r["variant"],
-                          data["baseline"]["status"], r["status"],
-                          r.get("impact") or "-", f["title"], f["emails"],
-                          f["niks"], f["phones"], f["links"],
-                          ",".join(f["sensitive"]) or "-"))
-            if f["snippet"]:
-                out.append("            \"%s\"" % f["snippet"][:120])
+        out.extend(render_findings(findings, data["baseline"]["status"], width))
     return "\n".join(out)
+
+
+MODE_CHOICES = ["path", "header", "method", "body", "encoding", "cookie",
+                "ctype", "size", "h2", "all"]
+
+LEVEL_HELP = (
+    "  level 1 = obvious rewrite: //, /./, trailing slash, case toggle,\n"
+    "            loopback X-Forwarded-For, Googlebot UA, GET/HEAD/OPTIONS\n"
+    "  level 2 = one parser differential: %2e, backslash, ..;/, trailing dot,\n"
+    "            url + double-url payload, X-Original-URL, method override, JSON body\n"
+    "  level 3 = double layer: %252e, %uXXXX, hex, MySQL comments, HPP,\n"
+    "            multipart, duplicate cookie\n"
+    "  level 4 = null/terminal framing: %00, %00.png, base64, HTML entity,\n"
+    "            phantom-octal cookie, chunked body, vendor size windows"
+)
+
+
+def _resize_hook(callback):
+    if not hasattr(signal, "SIGWINCH"):
+        return
+    def handler(signum, frame):
+        sys.stdout.write("\n")
+        callback()
+        sys.stdout.flush()
+    try:
+        signal.signal(signal.SIGWINCH, handler)
+    except (ValueError, OSError):
+        pass
+
+
+def repl(args):
+    last = None
+    print(BANNER.strip())
+    print("interactive mode. commands: run | url <u> | mode <m> | level <1-4> |")
+    print("  preset <p> | payload <text> | http2 <profile> | follow <n> |")
+    print("  repeat <n> | threads <n> | json on|off | impact on|off | quit\n")
+
+    def redraw():
+        if last is not None:
+            print(render(last, args.json, term_width()))
+            print("waf403x> ", end="")
+
+    _resize_hook(redraw)
+    while True:
+        try:
+            line = input("waf403x> ").strip()
+        except EOFError:
+            print()
+            return 0
+        except KeyboardInterrupt:
+            print()
+            return 0
+        if not line:
+            continue
+        parts = line.split()
+        cmd = parts[0].lower()
+        arg = line.split(None, 1)[1].strip() if len(parts) > 1 else ""
+        try:
+            if cmd in ("quit", "exit", "q"):
+                return 0
+            if cmd == "run":
+                data, code = run(args)
+                if data is None:
+                    print("[x] run failed (exit %d)" % code)
+                else:
+                    last = data
+                    print(render(data, args.json, term_width()))
+                    if args.json:
+                        print()
+            elif cmd == "url" and arg:
+                args.url = arg
+                print("url =", arg)
+            elif cmd == "mode" and arg in MODE_CHOICES:
+                args.mode = arg
+                print("mode =", arg)
+            elif cmd == "level" and arg in ("1", "2", "3", "4"):
+                args.level = int(arg)
+                print("level =", arg)
+            elif cmd == "levels":
+                print(LEVEL_HELP)
+            elif cmd == "preset" and arg in PRESETS:
+                args.preset = arg
+                print("preset =", arg)
+            elif cmd == "payload" and arg:
+                args.payload = arg
+                print("payload =", arg)
+            elif cmd == "http2" and arg in h2.PROFILES:
+                args.http2 = arg
+                print("http2 =", arg)
+            elif cmd == "follow" and arg.isdigit():
+                args.follow = int(arg)
+                print("follow =", arg)
+            elif cmd == "repeat" and arg.isdigit():
+                args.repeat = int(arg)
+                print("repeat =", arg)
+            elif cmd == "threads" and arg.isdigit():
+                args.threads = int(arg)
+                print("threads =", arg)
+            elif cmd == "json" and arg in ("on", "off"):
+                args.json = arg == "on"
+                print("json =", arg)
+            elif cmd == "impact" and arg in ("on", "off"):
+                args.impact = arg == "on"
+                print("impact =", arg)
+            elif cmd == "help":
+                print("run, url, mode, level, levels, preset, payload, http2, follow, "
+                      "repeat, threads, json, impact, quit")
+            else:
+                print("unknown command or bad value; type help")
+        except ValueError as exc:
+            print("[x] %s" % exc)
+
+
+def watch(args, interval):
+    print("[i] watch every %ds, Ctrl-C to stop" % interval)
+    last = None
+
+    def show():
+        if last is not None:
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.write(render(last, args.json, term_width()) + "\n")
+            sys.stdout.flush()
+
+    _resize_hook(show)
+    try:
+        while True:
+            data, code = run(args)
+            if data is not None:
+                last = data
+                show()
+            time.sleep(max(1, interval))
+    except KeyboardInterrupt:
+        return 0
+
+
+def _ask(prompt, default=""):
+    suffix = " [%s]" % default if default else ""
+    try:
+        value = input("%s%s: " % (prompt, suffix)).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return value or default
+
+
+def _print_banner():
+    width = term_width()
+    lines = BANNER.strip("\n").splitlines()
+    if width >= max(len(line) for line in lines) + 2:
+        for line in lines:
+            print(line.center(width))
+    else:
+        print("WAF403x".center(width))
+    print(("stdlib 403/WAF sweep engine  v%s" % VERSION).center(width))
+    print(("raw HTTP/1.1 + h2/HPACK | impact oracle | findings").center(width))
+    print()
+
+
+def welcome_menu(args):
+    options = [
+        ("1", "Scan URL (path/header/encoding sweep)"),
+        ("2", "HTTP/2 fingerprint scan"),
+        ("3", "Solve JS/CAPTCHA challenge, then scan"),
+        ("4", "Watch mode (repeat on interval, Ctrl-C to stop)"),
+        ("5", "Interactive shell (type commands, stays alive)"),
+        ("6", "Real WAF lab (ModSecurity CRS via podman)"),
+        ("7", "Help / examples"),
+        ("0", "Exit"),
+    ]
+    while True:
+        _print_banner()
+        width = term_width()
+        print("  MENU".ljust(width))
+        for key, label in options:
+            line = "  %s) %s" % (key, label)
+            for wrapped in textwrap.wrap(line, width=max(24, width - 2)) or [""]:
+                print(wrapped)
+        print()
+        choice = _ask("select menu", "1")
+        if choice is None or choice == "0":
+            print("bye.")
+            return 0
+        if choice == "1":
+            url = _ask("target URL", args.url or "")
+            if not url:
+                print("[x] empty URL\n")
+                continue
+            args.url = url
+            args.mode = _ask("mode (path/header/method/body/encoding/cookie/"
+                             "ctype/size/all)", args.mode)
+            if args.mode not in MODE_CHOICES:
+                print("[x] unknown mode\n")
+                continue
+            print(LEVEL_HELP)
+            lvl = _ask("level 1-4 (see above)", str(args.level))
+            args.level = int(lvl) if lvl in ("1", "2", "3", "4") else 4
+            rep = _ask("repeat", str(args.repeat))
+            args.repeat = int(rep) if rep.isdigit() else 2
+            data, code = run(args)
+            if data:
+                print()
+                print(render(data, args.json, term_width()))
+                print()
+            else:
+                print("[x] run failed (exit %d)\n" % code)
+        elif choice == "2":
+            url = _ask("target URL")
+            if not url:
+                print("[x] empty URL\n")
+                continue
+            args.url = url
+            args.mode = "h2"
+            args.http2 = _ask("profil h2 (chrome/firefox/safari/nghttp2/plain)",
+                              "chrome")
+            if args.http2 not in h2.PROFILES:
+                args.http2 = "chrome"
+            data, code = run(args)
+            if data:
+                print()
+                print(render(data, args.json, term_width()))
+                print()
+            else:
+                print("[x] run failed (exit %d)\n" % code)
+        elif choice == "3":
+            url = _ask("target URL")
+            if not url:
+                print("[x] empty URL\n")
+                continue
+            args.url = url
+            args.solve_challenge = True
+            args.cookies = True
+            args.follow = 2
+            print("[i] solving in a browser, 2-5 minutes; cookie cache TTL 900 s...")
+            data, code = run(args)
+            if data:
+                print()
+                print(render(data, args.json, term_width()))
+                print()
+            else:
+                print("[x] run failed (exit %d)\n" % code)
+        elif choice == "4":
+            url = _ask("target URL")
+            if not url:
+                print("[x] empty URL\n")
+                continue
+            args.url = url
+            interval = _ask("interval seconds", "60")
+            return watch(args, int(interval) if interval.isdigit() else 60)
+        elif choice == "5":
+            return repl(args)
+        elif choice == "6":
+            print()
+            print("  CRS lab steps (macOS/podman):")
+            print("    podman machine start")
+            print("    printf 'SecRule REQUEST_URI \"@beginsWith /users\" "
+                  "\"id:900001,phase:1,deny,status:403,log\"\\n' > "
+                  "~/wafbypass-crs.conf")
+            print("    python3 tests/sim_waf.py --host 0.0.0.0 &")
+            print("    podman run -d --name crs -p 8080:8080 -v "
+                  "\"$HOME/wafbypass-crs.conf:/etc/modsecurity.d/zz-custom.conf:ro\" \\")
+            print("      -e BACKEND=http://host.containers.internal:8099 "
+                  "-e PORT=8080 -e MODSEC_RULE_ENGINE=on \\")
+            print("      -e PARANOIA=1 -e BLOCKING_PARANOIA=1 "
+                  "owasp/modsecurity-crs:nginx")
+            print("    python3 wafbypass.py -u http://127.0.0.1:8080/users "
+                  "--mode path --level 2 -t 2 --repeat 2")
+            print()
+            _ask("Enter to return")
+        elif choice == "7":
+            print()
+            print("  Contoh:")
+            print("    wafbypass.py -u https://t/users --mode path --level 2")
+            print("    wafbypass.py -u 'https://t/search?q=1' --preset sqli "
+                  "--mode encoding")
+            print("    wafbypass.py -u https://t/ --http2 chrome --mode h2")
+            print("    wafbypass.py -u https://t/ --solve-challenge --follow 2")
+            print("    wafbypass.py -u https://t/ --watch 60")
+            print("    wafbypass.py -i          # shell interaktif")
+            print("    wafbypass.py --help")
+            print()
+            _ask("Enter to return")
+        else:
+            print("[x] no such option\n")
 
 
 def main(argv=None):
@@ -1263,14 +1678,26 @@ def main(argv=None):
     ap.add_argument("--delay", type=float, default=0.0, help="delay between requests (seconds)")
     ap.add_argument("--json", action="store_true", help="emit JSON")
     ap.add_argument("-o", "--out", default=None, help="write output to file")
+    ap.add_argument("-i", "--interactive", action="store_true",
+                    help="interactive shell, stays alive between runs")
+    ap.add_argument("--watch", type=int, default=0, metavar="SECONDS",
+                    help="re-run the same scan every N seconds (Ctrl-C stops)")
+    ap.add_argument("--menu", action="store_true",
+                    help="open the welcome menu")
     args = ap.parse_args(argv)
     if args.banner or args.version:
         sys.stdout.write(BANNER.lstrip("\n") + "\n")
         if args.version:
             sys.stdout.write("WAF403x %s\n" % VERSION)
         return 0
-    if not args.url:
-        ap.error("-u/--url is required")
+    if args.interactive:
+        return repl(args)
+    if args.watch:
+        if not args.url:
+            ap.error("-u/--url is required with --watch")
+        return watch(args, args.watch)
+    if args.menu or not args.url:
+        return welcome_menu(args)
 
     try:
         data, code = run(args)
@@ -1283,7 +1710,7 @@ def main(argv=None):
     if data is None:
         return code
 
-    text = render(data, args.json)
+    text = render(data, args.json, term_width())
     sys.stdout.write(text + "\n")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
