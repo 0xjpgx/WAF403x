@@ -125,7 +125,36 @@ a new browser solve.
 
 Screenshots: `screenshots/7a-no-solver.png`, `screenshots/7-solver-e2e.png`.
 
-## 8. TLS knobs (real host)
+## 9. Finding extraction after a bypass
+
+Fixture `/users`: the mock WAF blocks the exact path `/users` (403); rewrite
+variants reach the same app route, which returns a private directory.
+
+```
+$ python3 wafbypass.py -u http://127.0.0.1:8099/users --mode path --level 2 -t 2 --repeat 1
+[*] baseline GET /users -> 403 / 18 bytes  "403 Blocked by WAF"
+[+] SUMMARY variants=13 bypass=10 blocked=0 notfound=3 diff=0 error=0 unstable=0 challenge=0
+[i] impact: payload=0 access=0 unknown=10
+[+] FINDINGS (baseline 403 -> bypass 200)
+  path      double-slash           403->200 impact=unknown title='User Directory' emails=3 niks=3 phones=3 links=0 sensitive=password,token
+            "User Directory User Directory budi budi.santoso@example.co.id +6281234567890 3274010101900001 ..."
+```
+
+The JSON form carries the same data per row:
+
+```
+$ python3 wafbypass.py -u http://127.0.0.1:8099/users --mode path --level 1 --json --repeat 0 \
+    | jq -r '.rows[] | select(.verdict=="BYPASS") | [.variant,.status,.impact,.finding.emails,.finding.niks,.finding.phones] | @tsv'
+double-slash  200  unknown  3  3  3
+dot-segment   200  unknown  3  3  3
+trailing-slash 200 unknown  3  3  3
+```
+
+Screenshot: `screenshots/9-finding-users.png`. Values are fixture data; the
+rule itself (403 -> 200 with PII counts) is what the engine reports on any
+target.
+
+## 10. TLS knobs (real host)
 
 ```
 $ python3 wafbypass.py -u https://www.wikipedia.org --ciphers ECDHE-RSA-AES128-GCM-SHA256 \

@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import socket
 import ssl
 import string
@@ -497,6 +498,40 @@ def snippet(resp):
     return txt
 
 
+EMAIL_RE = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+NIK_RE = re.compile(rb"\b\d{16}\b")
+PHONE_RE = re.compile(rb"(?:\+62|62|0)8[1-9]\d{6,11}\b")
+SENSITIVE = (b"password", b"passwd", b"api_key", b"apikey", b"secret",
+             b"token", b"nik", b"npwp", b"creditcard", b"confidential",
+             b"flag{")
+FINDING_MARKERS = (b"admin", b"dashboard", b"user list", b"users",
+                   b"confidential", b"internal", b"private", b"flag{")
+
+
+def finding(resp):
+    """What a bypassed response exposes: title, text, PII-ish counts, markers."""
+    body = resp.body
+    low = body.lower()
+    title = ""
+    match = re.search(rb"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    if match:
+        title = " ".join(match.group(1).decode("utf-8", "replace").split())[:90]
+    text = re.sub(rb"<script.*?</script>|<style.*?</style>", b" ", body,
+                  flags=re.I | re.S)
+    text = re.sub(rb"<[^>]+>", b" ", text)
+    text = " ".join(text.decode("utf-8", "replace").split())
+    return {
+        "title": title,
+        "snippet": text[:160],
+        "emails": len(set(EMAIL_RE.findall(body))),
+        "niks": len(set(NIK_RE.findall(body))),
+        "phones": len(set(PHONE_RE.findall(body))),
+        "links": len(re.findall(rb"href=", low)),
+        "sensitive": [m.decode() for m in SENSITIVE if m in low][:8],
+        "markers": [m.decode() for m in FINDING_MARKERS if m in low][:8],
+    }
+
+
 # --------------------------------------------------------------------------
 # variants
 # --------------------------------------------------------------------------
@@ -757,6 +792,30 @@ def variant_level(v):
     return LEVELS.get(v["name"], 2)
 
 
+BENIGN = "wafbypass_probe_9f3a"
+
+
+def twin_variant(v, t, param, profile):
+    """Same transform, harmless payload; None when the variant has no payload."""
+    mode = v["mode"]
+    if mode == "encoding":
+        cands = encoding_variants(t, param, BENIGN)
+    elif mode == "cookie":
+        cands = cookie_variants(t, BENIGN)
+    elif mode == "ctype":
+        cands = ctype_variants(t, param, BENIGN)
+    elif mode == "body":
+        cands = body_variants(t, param, BENIGN)
+    elif mode == "size":
+        cands = size_variants(t, profile, BENIGN)
+    else:
+        return None
+    for cand in cands:
+        if cand["name"] == v["name"]:
+            return cand
+    return None
+
+
 def h2_variants(t):
     """Same request, different client fingerprints; each opens a connection."""
     out = []
@@ -935,13 +994,16 @@ def run(args):
 
     rows = []
     for v, resp in results:
+        verdict = classify(resp, base, ctrl)
         rows.append({
             "mode": v["mode"],
             "variant": v["name"],
             "method": v["method"],
             "status": resp.status,
             "bytes": resp.length,
-            "verdict": classify(resp, base, ctrl),
+            "verdict": verdict,
+            "impact": None,
+            "finding": finding(resp) if verdict == "BYPASS" else None,
             "snippet": snippet(resp),
             "error": resp.error,
         })
@@ -961,6 +1023,32 @@ def run(args):
                 and 200 <= rows[pi]["status"] < 400 and rows[pi]["bytes"] > 0
                 and results[pi][1].body != results[ci][1].body):
             rows[pi]["verdict"] = "BYPASS"
+
+    # Impact oracle: replay every BYPASS with a harmless payload through the
+    # same transform. Identical response means the transform itself slipped
+    # past the WAF (access), a different response means the payload changed
+    # app behaviour (payload).
+    impact = {"payload": 0, "access": 0, "unknown": 0}
+    if args.impact:
+        for i, row in enumerate(rows):
+            row["impact"] = None
+            if row["verdict"] != "BYPASS":
+                continue
+            twin = twin_variant(variants[i], t, args.param, args.profile)
+            if twin is None:
+                row["impact"] = "unknown"
+            else:
+                tr = fetch(t, twin, timeout, delay, opts, jar, jar_lock)
+                orig = results[i][1]
+                if tr.status != orig.status or tr.body != orig.body:
+                    row["impact"] = "payload"
+                else:
+                    row["impact"] = "access"
+            impact[row["impact"]] += 1
+
+    for i, row in enumerate(rows):
+        if row["verdict"] == "BYPASS" and row.get("finding") is None:
+            row["finding"] = finding(results[i][1])
 
     # stability gate: identical bytes, fresh connection, sequential so the
     # comparison is not perturbed by concurrent retries of other candidates.
@@ -997,6 +1085,7 @@ def run(args):
               and similarity(base.text(), ctrl.text()) >= 0.90)
 
     summary = {"variants": len(rows), "repeat": repeat, "masked": masked,
+               "impact": impact if args.impact else None,
                "stability": {"retried": len(candidates), "confirmed": confirmed}}
     summary.update(counts)
     data = {
@@ -1077,6 +1166,11 @@ def render(data, as_json):
     if s["repeat"]:
         out.append("[i] stability: %d/%d confirmed"
                    % (st["confirmed"], st["retried"]))
+    if s.get("impact"):
+        imp = s["impact"]
+        out.append("[i] impact: payload=%d access=%d unknown=%d "
+                   "(access = transform slipped through, app response unchanged)"
+                   % (imp["payload"], imp["access"], imp["unknown"]))
     else:
         out.append("[i] stability: disabled (--repeat 0)")
     byp = [r for r in data["rows"] if r["verdict"] == "BYPASS"]
@@ -1089,6 +1183,23 @@ def render(data, as_json):
     if uns:
         out.append("[!] UNSTABLE rows: " + ", ".join(
             "%s/%s(%d)" % (r["mode"], r["variant"], r["status"]) for r in uns))
+    findings = [r for r in data["rows"] if r.get("finding")]
+    if findings:
+        out.append("")
+        out.append("[+] FINDINGS (baseline %s -> bypass %s)"
+                   % (data["baseline"]["status"],
+                      ",".join(sorted(set(str(r["status"]) for r in findings)))))
+        for r in findings:
+            f = r["finding"]
+            out.append("  %-9s %-22s %s->%d impact=%s title=%r emails=%d niks=%d "
+                       "phones=%d links=%d sensitive=%s"
+                       % (r["mode"], r["variant"],
+                          data["baseline"]["status"], r["status"],
+                          r.get("impact") or "-", f["title"], f["emails"],
+                          f["niks"], f["phones"], f["links"],
+                          ",".join(f["sensitive"]) or "-"))
+            if f["snippet"]:
+                out.append("            \"%s\"" % f["snippet"][:120])
     return "\n".join(out)
 
 
@@ -1139,6 +1250,8 @@ def main(argv=None):
     ap.add_argument("--level", type=int, default=4, choices=[1, 2, 3, 4],
                     help="escalation level: 1 obvious, 2 single differential, "
                          "3 double layer, 4 null framing/size windows (default 4)")
+    ap.add_argument("--no-impact", dest="impact", action="store_false",
+                    help="skip the benign-twin impact oracle for BYPASS rows")
     ap.add_argument("--repeat", type=int, default=2,
                     help="stability re-sends per BYPASS/DIFF candidate (default 2)")
     ap.add_argument("--param", default="q", help="query parameter to inject (default: q)")

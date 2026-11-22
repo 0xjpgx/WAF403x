@@ -71,6 +71,34 @@ on the same host, used as the soft-404 signature.
 
 Similarity is `difflib.SequenceMatcher` over the first 4000 decoded chars.
 
+## Impact and findings
+
+A `BYPASS` only means the WAF let the request through. After the sweep every
+BYPASS row is replayed once with a harmless payload through the same
+transform (the impact oracle), which labels the row:
+
+| `impact` | Meaning |
+|---|---|
+| `payload` | benign twin behaves differently: the payload changed app response |
+| `access` | twin is identical: the transform itself skipped the WAF, app output unchanged |
+| `unknown` | transform has no payload (path/header/method/h2) |
+
+Every BYPASS row also gets a `finding` record extracted from the response it
+reached: `<title>`, visible text snippet, counts of emails, 16-digit NIKs and
+Indonesian phone numbers, `href` count, and sensitive markers
+(`password`, `token`, `api_key`, `npwp`, `flag{`, ...). The text report adds a
+`FINDINGS (baseline 403 -> bypass 200)` block, e.g.:
+
+```
+[+] FINDINGS (baseline 403 -> bypass 200)
+  path      double-slash           403->200 impact=unknown title='User Directory' emails=3 niks=3 phones=3 links=0 sensitive=password,token
+            "User Directory User Directory budi budi.santoso@example.co.id +6281234567890 3274010101900001 ..."
+```
+
+That is the deliverable of a bypass: status transition plus the information
+that became readable. `--no-impact` skips the twin request when request volume
+matters.
+
 ## Stability gate
 
 Every row initially classified `BYPASS` or `DIFF` is re-sent `--repeat` times

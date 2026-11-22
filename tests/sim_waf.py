@@ -47,6 +47,16 @@ COOKIE_BLOCKED = b"403 cookie blocked"
 COOKIE_OK = b"COOKIE OK"
 FLAKY_OK = b"FLAKY OK"
 ADMIN = b"ADMIN PANEL flag{waf_bypass}"
+USERS = (b"<html><head><title>User Directory</title></head><body>"
+         b"<h1>User Directory</h1><table>"
+         b"<tr><td>budi</td><td>budi.santoso@example.co.id</td>"
+         b"<td>+6281234567890</td><td>3274010101900001</td></tr>"
+         b"<tr><td>sari</td><td>sari.wulandari@example.co.id</td>"
+         b"<td>+6281298765432</td><td>3274010202910002</td></tr>"
+         b"<tr><td>andi</td><td>andi.pratama@example.co.id</td>"
+         b"<td>+6281311122233</td><td>3274010303920003</td></tr>"
+         b"</table><p>internal use only - password reset token: a1b2c3</p>"
+         b"</body></html>")
 SEARCH = b"SEARCH OK"
 BODYOK = b"BODY OK"
 NOTFOUND = b"404 Not Found"
@@ -153,6 +163,8 @@ class Handler(BaseHTTPRequestHandler):
             return False, "rule4-trusted-header"
         if path.startswith("/admin"):
             return True, "rule1-path-admin"
+        if path == "/users":
+            return True, "rule-path-users"
         if path == "/search" and attack_string(unquote_plus(query)):
             return True, "rule2-query-signature"
         if path == "/submit":
@@ -169,6 +181,8 @@ class Handler(BaseHTTPRequestHandler):
         norm = normalize(path)
         if norm in ("/admin.php", "/admin"):
             return 200, ADMIN
+        if norm == "/users":
+            return 200, USERS
         if norm == "/search":
             return 200, SEARCH
         if norm == "/submit":
