@@ -350,7 +350,7 @@ def send_raw(t, raw, timeout, opts=None, method="GET"):
                 pass
     resp = parse_response(data, opts.get("max_body", MAX_BODY),
                           timed_out=timed_out, method=method)
-    resp.proto = "h1"
+    resp.proto = "h1" if resp.status else "none"
     return resp
 
 
@@ -368,16 +368,17 @@ def send_h2(t, v, headers, timeout, opts):
         if t.scheme == "https":
             ctx = _tls_context(opts, ["h2"])
             sock = ctx.wrap_socket(sock, server_hostname=t.host)
-            if sock.selected_alpn_protocol() != "h2":
+            negotiated = sock.selected_alpn_protocol()
+            if negotiated != "h2":
                 return Response(0, {}, b"",
-                                "ALPN negotiated %r, not h2"
-                                % sock.selected_alpn_protocol(), proto="h2")
+                                "ALPN negotiated %r, not h2" % (negotiated,),
+                                proto=negotiated or "none")
         status, hlist, body, err = h2.request(
             sock, v["method"], wire_safe(v["target"]), hdrs, v["body"],
             scheme=t.scheme, profile=profile, order=order, priority=priority)
     except (socket.timeout, OSError, ssl.SSLError, ValueError) as exc:
         return Response(0, {}, b"", "%s: %s" % (type(exc).__name__, exc),
-                        proto="h2")
+                        proto="none")
     finally:
         if sock is not None:
             try:
@@ -385,7 +386,7 @@ def send_h2(t, v, headers, timeout, opts):
             except OSError:
                 pass
     if err:
-        return Response(0, {}, b"", err, proto="h2")
+        return Response(0, {}, b"", err, proto="none")
     body = body[:opts.get("max_body", MAX_BODY)]
     out_headers = {}
     cookies = []
@@ -456,22 +457,26 @@ def send_h3(t, v, headers, timeout, opts, method="GET"):
             [opts["h3_python"], worker],
             input=json.dumps(request).encode("utf-8"),
             capture_output=True, timeout=timeout + 12)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
+        return Response(0, {}, b"",
+                        "h3 backend timeout after %.0fs" % (timeout + 12),
+                        final_method=method, proto="none")
+    except OSError as exc:
         return Response(0, {}, b"", "h3 backend error: %s" % exc,
-                        final_method=method, proto="h3")
+                        final_method=method, proto="none")
     out = (proc.stdout or b"").decode("utf-8", "replace").strip()
     try:
         doc = json.loads(out.splitlines()[-1]) if out else {}
     except ValueError:
         return Response(0, {}, b"", "h3 worker bad output: %r" % out[:120],
-                        final_method=method, proto="h3")
+                        final_method=method, proto="none")
     if doc.get("error"):
         return Response(0, {}, b"", "h3: %s" % doc["error"],
-                        final_method=method, proto="h3")
+                        final_method=method, proto="none")
     status = doc.get("status")
     if status is None:
         return Response(0, {}, b"", "h3: no :status in response",
-                        final_method=method, proto="h3")
+                        final_method=method, proto="none")
     out_headers = {}
     cookies = []
     for name, value in doc.get("headers") or []:
@@ -1281,10 +1286,10 @@ def run(args):
     for v, resp in results:
         verdict = classify(resp, base, ctrl)
         rows.append({
-            "variant": ("proto-" + resp.proto
-                        if v["mode"] == "proto" else v["name"]),
+            "variant": v["name"],
             "mode": v["mode"],
             "method": getattr(resp, "final_method", v["method"]),
+            "proto": resp.proto,
             "status": resp.status,
             "bytes": resp.length,
             "verdict": verdict,

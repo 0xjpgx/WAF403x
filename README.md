@@ -318,12 +318,15 @@ challenge, payload, baseline, control, rows, summary`. Every element of `rows` h
 verdict:
 
 ```
-variant, mode, method, status, bytes, verdict, snippet, impact,
+variant, mode, method, proto, status, bytes, verdict, snippet, impact,
 finding, error, retries, stable
 ```
 
-`retries` is `0` and `stable` is `null` for rows the stability gate did not
-retry; a retried row carries the send count and `true`/`false`. A strict
+`proto` is the transport actually used: `h1`, `h2`, `h3`, the ALPN the server
+negotiated when it was not the requested one (for example `http/1.1`), or
+`none` when no HTTP response/ALPN was obtained. `retries` is `0` and `stable`
+is `null` for rows the stability gate did not retry; a retried row carries the
+send count and `true`/`false`. A strict
 consumer can read any key on any row without switching on the verdict.
 
 A fatal scan (bad URL, baseline failure, fatal transport, bad CLI range such
