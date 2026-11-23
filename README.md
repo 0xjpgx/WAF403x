@@ -10,8 +10,8 @@ __        ___    _____ _  _    ___ _____
 
 Stdlib-only 403/WAF bypass sweep engine. It builds raw HTTP/1.1 request bytes
 by hand and writes them to a socket, so `%2e`, `//`, `..;/`, `%00`, backslashes
-and duplicate headers reach the WAF/origin exactly as typed. No `requests`, no
-`urllib` transport. Python 3.9+.
+and duplicate cookie names reach the WAF/origin exactly as typed. No
+`requests`, no `urllib` transport. Python 3.9+.
 
 ## Usage
 
@@ -77,16 +77,18 @@ buffer and stays scrollable; press Enter to return to the fixed menu. It prompts
 repeat. Before the level prompt it
 prints what each level adds (1 obvious rewrite, 2 single parser differential,
 3 double layer, 4 null/terminal framing), then prints the same report as the
-CLI. `-i` keeps the process (and the cookie jar / solved challenge)
-alive: change `url`, `mode`, `level`, `preset`, `payload`, `http2`, `follow`,
+CLI. `-i` keeps the process alive (the 900 s disk challenge cache persists;
+the cookie jar is rebuilt on every `run`): change `url`, `mode`, `level`,
+`preset`, `payload`, `http2`, `follow`,
 `repeat`, `threads`, `json on|off`, `impact on|off`, then `run`. `--watch`
 clears the screen and re-renders every interval; on terminal resize
 (`SIGWINCH`) both `-i` and `--watch` re-render immediately.
 
 Output adapts to the terminal width read from `COLUMNS`/tty: at 78+ columns a
 single table with a fitted snippet column, below 78 a stacked two-line row
-with wrapped snippets. Findings with identical disclosure are grouped once
-(`N variant(s): ...`) instead of repeated per row.
+with wrapped snippets. Findings with identical disclosure are grouped once:
+a `severity=<sev> title='<title>' variants=N` header, then an indented
+`    variants: <mode/variant names>` line, instead of repeated per row.
 
 Baseline is the un-obfuscated attack for the selected mode: raw payload in the
 query for `encoding`/`all`, the canonical urlencoded POST for `body`/`ctype`/
@@ -263,8 +265,8 @@ attempts with a short cap and reports a silent handshake as
 `h3: no QUIC response (host may not offer h3)`. `--h3-force` bypasses the
 preflight and tries QUIC anyway.
 
-`--http3` switches the whole run (baseline, control, every variant) to QUIC v1
-with ALPN `h3`. `--mode proto --protocols h1,h2,h3` (or bare
+`--http3` switches the whole run (baseline, control, every variant) to QUIC
+(v1 or v2, as offered by aioquic) with ALPN `h3`. `--mode proto --protocols h1,h2,h3` (or bare
 `--protocols h1,h2,h3`) replays the identical GET across the selected
 transports and labels each row with the transport actually used
 (`proto-h1`, `proto-h2`, `proto-h3`); baseline and control stay on h1.
@@ -381,6 +383,7 @@ the local mocks used by those runs.
 ```
 wafbypass.py         sweep engine (the tool)
 h2.py                HTTP/2 + HPACK client used by --http2
+h3.py                HTTP/3 client (aioquic) used by --http3
 challenge.py         stealth-browser cookie minting (--solve-challenge)
 tools/wafdetect.py   WAF fingerprint helper
 tools/shot.py        transcript -> PNG renderer for docs/screenshots

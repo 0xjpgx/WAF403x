@@ -733,6 +733,7 @@ CHALLENGE_MARKERS = (
     b"unusual traffic", b"px-captcha", b"captcha-delivery",
     b"verify you are human", b"ddos-guard", b"_incapsula_resource",
     b"please wait while we verify", b"turnstile",
+    b"hcaptcha", b"h-captcha",
 )
 
 
