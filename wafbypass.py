@@ -9,8 +9,8 @@ parses the URL supplied by the operator.
 Baseline: the un-obfuscated attack for the selected mode - a GET with the
 raw payload injected into the query for payload-bearing modes (encoding/all),
 the canonical urlencoded POST for body mode, otherwise the URL as given. A
-baseline that already answers 2xx means nothing is blocked, so the run prints
-an "[i] baseline already returns 2xx" line and no BYPASS can be proven.
+baseline that already answers 2xx/3xx means nothing is blocked, so the run prints
+an "[i] baseline already returns 2xx/3xx" line and no BYPASS can be proven.
 
 Verdicts per response (relative to the baseline and a soft-404 control):
   ERROR     no response
@@ -144,15 +144,18 @@ def parse_url(url):
 
 
 class Response(object):
-    __slots__ = ("status", "headers", "body", "error", "cookies", "hops")
+    __slots__ = ("status", "headers", "body", "error", "cookies", "hops",
+                 "final_method")
 
-    def __init__(self, status, headers, body, error=None, cookies=None, hops=0):
+    def __init__(self, status, headers, body, error=None, cookies=None, hops=0,
+                 final_method=None):
         self.status = status
         self.headers = headers
         self.body = body
         self.error = error
         self.cookies = cookies or []
         self.hops = hops
+        self.final_method = final_method
 
     def text(self):
         return self.body[:SIM_CHARS * 4].decode("utf-8", "replace")[:SIM_CHARS]
@@ -204,13 +207,16 @@ def build_request(t, method, target, headers=None, body=None, ua=UA_DEFAULT):
 
 
 def _recv_all(sock, max_body=MAX_BODY):
+    """Read until close or the body cap. Returns (data, timed_out)."""
     chunks = []
     total = 0
     limit = max_body + MAX_HEADER
+    timed_out = False
     while total < limit:
         try:
             buf = sock.recv(65536)
         except socket.timeout:
+            timed_out = True
             break
         except OSError:
             break
@@ -218,13 +224,15 @@ def _recv_all(sock, max_body=MAX_BODY):
             break
         chunks.append(buf)
         total += len(buf)
-    return b"".join(chunks)
+    return b"".join(chunks), timed_out
 
 
 def _dechunk(data):
+    """Decode chunked framing. Returns (body, saw_zero_chunk)."""
     out = []
     pos = 0
     n = len(data)
+    complete = False
     while pos < n:
         eol = data.find(b"\r\n", pos)
         if eol < 0:
@@ -239,13 +247,14 @@ def _dechunk(data):
             break
         pos = eol + 2
         if size == 0:
+            complete = True
             break
         out.append(data[pos:pos + size])
         pos += size + 2
-    return b"".join(out)
+    return b"".join(out), complete
 
 
-def parse_response(data, max_body=MAX_BODY):
+def parse_response(data, max_body=MAX_BODY, timed_out=False, method="GET"):
     if not data:
         return Response(0, {}, b"", "empty response")
     sep = data.find(b"\r\n\r\n")
@@ -274,14 +283,31 @@ def parse_response(data, max_body=MAX_BODY):
             if key == "set-cookie":
                 cookies.append(v.strip())
     te = headers.get("transfer-encoding", "").lower()
+    # A response that ended at a read timeout with framing that promised more
+    # bytes is truncated, not a small page: callers must not diff prefixes of
+    # a page against a whole one.
+    capped = len(data) >= max_body + MAX_HEADER
+    wants_body = method != "HEAD" and status >= 200 and status not in (204, 304)
     if "chunked" in te:
-        body = _dechunk(body)
+        body, complete = _dechunk(body)
+        if wants_body and not complete and not capped:
+            reason = "read timeout" if timed_out else "connection closed"
+            return Response(0, headers, b"", "truncated chunked body (%s)" % reason)
     elif "content-length" in headers:
         try:
             cl = int(headers["content-length"])
-            body = body[:cl]
         except ValueError:
-            pass
+            cl = None
+        if cl is not None:
+            if wants_body and not capped and len(body) < cl:
+                reason = "read timeout" if timed_out else "connection closed"
+                return Response(0, headers, b"",
+                                "truncated body: %d/%d bytes (%s)"
+                                % (len(body), cl, reason))
+            body = body[:cl]
+    elif timed_out and wants_body and not capped:
+        return Response(0, headers, b"",
+                        "read timeout with close-delimited body")
     if len(body) > max_body:
         body = body[:max_body]
     return Response(status, headers, body, cookies=cookies)
@@ -303,7 +329,7 @@ def _tls_context(opts, alpn=None):
     return ctx
 
 
-def send_raw(t, raw, timeout, opts=None):
+def send_raw(t, raw, timeout, opts=None, method="GET"):
     opts = opts or {}
     sock = None
     try:
@@ -312,7 +338,7 @@ def send_raw(t, raw, timeout, opts=None):
         if t.scheme == "https":
             sock = _tls_context(opts).wrap_socket(sock, server_hostname=t.host)
         sock.sendall(raw)
-        data = _recv_all(sock, opts.get("max_body", MAX_BODY))
+        data, timed_out = _recv_all(sock, opts.get("max_body", MAX_BODY))
     except (socket.timeout, OSError, ssl.SSLError) as exc:
         return Response(0, {}, b"", "%s: %s" % (type(exc).__name__, exc))
     finally:
@@ -321,7 +347,8 @@ def send_raw(t, raw, timeout, opts=None):
                 sock.close()
             except OSError:
                 pass
-    return parse_response(data, opts.get("max_body", MAX_BODY))
+    return parse_response(data, opts.get("max_body", MAX_BODY),
+                          timed_out=timed_out, method=method)
 
 
 def send_h2(t, v, headers, timeout, opts):
@@ -393,7 +420,7 @@ def _send_once(t, v, timeout, opts, cookie_hdr):
         return send_h2(t, v, headers, timeout, opts)
     raw = build_request(t, v["method"], v["target"], headers, v["body"],
                         opts.get("ua", UA_DEFAULT))
-    return send_raw(t, raw, timeout, opts)
+    return send_raw(t, raw, timeout, opts, method=v["method"])
 
 
 def _same_host(t, url):
@@ -415,6 +442,7 @@ def fetch(t, v, timeout, delay, opts, jar=None, jar_lock=None):
     resp = _send_once(t, v, timeout, opts, cookie_hdr)
     if jar is not None:
         _jar_update(jar, resp.cookies, jar_lock)
+    resp.final_method = v["method"]
     if not opts.get("follow"):
         return resp
     from urllib.parse import urljoin
@@ -438,6 +466,7 @@ def fetch(t, v, timeout, delay, opts, jar=None, jar_lock=None):
             _jar_update(jar, resp.cookies, jar_lock)
         hops += 1
         resp.hops = hops
+        resp.final_method = cur_v["method"]
     return resp
 
 
@@ -489,7 +518,12 @@ def classify(resp, base, ctrl):
     sim_ctrl = similarity(txt, ctrl.text())
     if resp.status == ctrl.status and sim_ctrl >= 0.90:
         return "NOTFOUND"
-    if (200 <= resp.status < 400 and len(resp.body) > 0 and sim_base < 0.90
+    # A bypass needs something blocked to bypass: with a permissive baseline
+    # (2xx/3xx) a different 2xx body is an echo/routing differential, not a
+    # WAF skip. Size pairs are promoted separately in run().
+    base_blocked = not (200 <= base.status < 400)
+    if (base_blocked and 200 <= resp.status < 400 and len(resp.body) > 0
+            and sim_base < 0.90
             and not (resp.status == ctrl.status and sim_ctrl >= 0.90)):
         return "BYPASS"
     return "DIFF"
@@ -508,7 +542,7 @@ def snippet(resp):
 
 EMAIL_RE = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 NIK_RE = re.compile(rb"\b\d{16}\b")
-PHONE_RE = re.compile(rb"(?:\+62|62|0)8[1-9]\d{6,11}\b")
+PHONE_RE = re.compile(rb"(?<![0-9.])(?:\+62|62|0)8[1-9]\d{6,11}\b")
 SENSITIVE = (b"password", b"passwd", b"api_key", b"apikey", b"secret",
              b"token", b"nik", b"npwp", b"creditcard", b"confidential",
              b"flag{")
@@ -528,7 +562,12 @@ def _valid_nik(raw):
     if int(text[:2]) not in NIK_PROVINCES:
         return False
     day, month = int(text[6:8]), int(text[8:10])
-    return 1 <= day <= 31 and 1 <= month <= 12
+    if not 1 <= month <= 12:
+        return False
+    # DD/MM/YY: DD is 01-31 for males and 41-71 for females (birth day + 40).
+    if 41 <= day <= 71:
+        day -= 40
+    return 1 <= day <= 31
 
 
 def _mask_nik(value):
@@ -570,10 +609,19 @@ def finding(resp):
     text = " ".join(text.decode("utf-8", "replace").split())
     emails = sorted(set(x.decode("latin-1", "replace")
                         for x in EMAIL_RE.findall(body)))[:10]
-    phones = sorted(set(x.decode("latin-1", "replace")
-                        for x in PHONE_RE.findall(body)))[:10]
+    phones = []
+    for x in sorted(set(PHONE_RE.findall(body))):
+        phones.append(x.decode("latin-1", "replace"))
+    seen = {}
+    for p in phones:
+        seen.setdefault(p.lstrip("+"), p)
+    phones = list(seen.values())[:10]
     raw_niks = sorted(set(x for x in NIK_RE.findall(body) if _valid_nik(x)))[:10]
-    niks = [_mask_nik(x) for x in raw_niks]
+    niks = []
+    for x in raw_niks:
+        m = _mask_nik(x)
+        if m not in niks:
+            niks.append(m)
     sensitive = [m.decode() for m in SENSITIVE
                  if (m == b"flag{" and m in low)
                  or re.search(rb"\b" + re.escape(m) + rb"\b", low)][:8]
@@ -964,6 +1012,17 @@ def solve_challenge(url, python, timeout, refresh=False):
     return data, None
 
 
+LAST_ERROR = ""
+
+
+def _fail(message):
+    """Record a fatal scan error for the CLI / JSON error object."""
+    global LAST_ERROR
+    LAST_ERROR = message
+    sys.stderr.write("[x] %s\n" % message)
+    return None, 2
+
+
 def run(args):
     t = parse_url(args.url)
     if args.preset:
@@ -981,8 +1040,7 @@ def run(args):
     else:
         modes = [args.mode]
     if args.mode == "h2" and args.http2 == "off":
-        sys.stderr.write("[x] --mode h2 needs --http2 <profile>\n")
-        return None, 2
+        return _fail("--mode h2 needs --http2 <profile>")
 
     timeout = max(0.5, float(args.timeout))
     threads = max(1, int(args.threads))
@@ -1008,8 +1066,7 @@ def run(args):
         solved, err = solve_challenge(args.url, solver_py, args.solver_timeout,
                                       args.solver_refresh)
         if solved is None:
-            sys.stderr.write("[x] challenge solver failed: %s\n" % err)
-            return None, 2
+            return _fail("challenge solver failed: %s" % err)
         opts["ua"] = solved.get("user_agent") or UA_DEFAULT
         jar = dict(solved.get("cookies") or {})
         challenge = {
@@ -1041,8 +1098,7 @@ def run(args):
 
     base = fetch(t, base_v, timeout, 0.0, opts, jar, jar_lock)
     if base.status == 0:
-        sys.stderr.write("[x] baseline failed: %s\n" % (base.error or "no response"))
-        return None, 2
+        return _fail("baseline failed: %s" % (base.error or "no response"))
 
     ctrl_path = "/" + "".join(random.choice(string.ascii_lowercase + string.digits)
                               for _ in range(12))
@@ -1052,8 +1108,7 @@ def run(args):
     variants = build_variants(t, modes, args.param, payload, args.profile,
                               args.level)
     if not variants:
-        sys.stderr.write("[x] no variants generated\n")
-        return None, 2
+        return _fail("no variants generated")
 
     results = [None] * len(variants)
 
@@ -1069,16 +1124,18 @@ def run(args):
     for v, resp in results:
         verdict = classify(resp, base, ctrl)
         rows.append({
-            "mode": v["mode"],
             "variant": v["name"],
-            "method": v["method"],
+            "mode": v["mode"],
+            "method": getattr(resp, "final_method", v["method"]),
             "status": resp.status,
             "bytes": resp.length,
             "verdict": verdict,
+            "snippet": snippet(resp),
             "impact": None,
             "finding": finding(resp) if verdict == "BYPASS" else None,
-            "snippet": snippet(resp),
             "error": resp.error,
+            "retries": 0,
+            "stable": None,
         })
 
     # size differential: only call it a bypass when the offset-0 control is
@@ -1092,7 +1149,8 @@ def run(args):
         ci = d.get("ctl")
         if pi is None or ci is None:
             continue
-        if (rows[ci]["verdict"] == "BLOCKED"
+        if (not (200 <= base.status < 400)
+                and rows[ci]["verdict"] == "BLOCKED"
                 and 200 <= rows[pi]["status"] < 400 and rows[pi]["bytes"] > 0
                 and results[pi][1].body != results[ci][1].body):
             rows[pi]["verdict"] = "BYPASS"
@@ -1145,6 +1203,30 @@ def run(args):
             confirmed += 1
         else:
             rows[idx]["verdict"] = "UNSTABLE"
+            rows[idx]["finding"] = None
+
+    # A size row is evidence only when its own offset-0 control was blocked;
+    # after the stability gate that control may have been demoted, so enforce
+    # the invariant on the final verdicts. When the control is not BLOCKED the
+    # pair proves nothing (the host simply served the payload), so neither half
+    # may stay BYPASS.
+    for d in pairs.values():
+        pi, ci = d.get("padded"), d.get("ctl")
+        if pi is None or ci is None:
+            continue
+        if rows[ci]["verdict"] != "BLOCKED":
+            for i in (pi, ci):
+                if rows[i]["verdict"] == "BYPASS":
+                    rows[i]["verdict"] = "DIFF"
+                    rows[i]["finding"] = None
+
+    # The oracle ran before the stability gate; only rows that survived that
+    # gate are still BYPASS, so the summary must not count demoted ones.
+    if args.impact:
+        impact = {"payload": 0, "access": 0, "unknown": 0}
+        for row in rows:
+            if row["verdict"] == "BYPASS" and row.get("impact"):
+                impact[row["impact"]] += 1
 
     counts = {"BYPASS": 0, "BLOCKED": 0, "NOTFOUND": 0, "DIFF": 0,
               "ERROR": 0, "UNSTABLE": 0, "CHALLENGE": 0}
@@ -1162,6 +1244,7 @@ def run(args):
                "stability": {"retried": len(candidates), "confirmed": confirmed}}
     summary.update(counts)
     data = {
+        "ok": True,
         "url": args.url,
         "mode": args.mode,
         "level": args.level,
@@ -1173,16 +1256,18 @@ def run(args):
         "max_body": opts["max_body"],
         "challenge": challenge,
         "payload": payload,
-        "baseline": {"method": base_v["method"], "target": base_v["target"],
+        "baseline": {"method": getattr(base, "final_method", base_v["method"]),
+                     "target": base_v["target"],
                      "status": base.status, "bytes": base.length,
                      "challenge": challenge_kind(base),
                      "snippet": snippet(base), "blocked": not 200 <= base.status < 400},
         "control": {"status": ctrl.status, "bytes": ctrl.length,
-                    "snippet": snippet(ctrl)},
+                    "error": ctrl.error, "snippet": snippet(ctrl)},
         "rows": rows,
         "summary": summary,
     }
-    return data, (0 if counts["BYPASS"] else 1)
+    ok = counts["BYPASS"] > 0 and not (200 <= base.status < 400)
+    return data, (0 if ok else 1)
 
 
 def term_width(default=100):
@@ -1207,7 +1292,11 @@ def emit(out, line, width):
 def render_rows(rows, width):
     out = []
     if width < 78:
-        out.append("MODE/VARIANT          METHOD STATUS BYTES VERDICT")
+        hdr = "MODE/VARIANT          METHOD STATUS BYTES VERDICT"
+        if len(hdr) > width:
+            out.append(fit("MODE/VARIANT", width))
+            hdr = "METHOD STATUS BYTES VERDICT"
+        out.append(hdr)
         out.append("-" * min(width, 64))
         for r in rows:
             out.append(fit("%s/%s  %s %s %s %s"
@@ -1219,11 +1308,11 @@ def render_rows(rows, width):
                     out.append("  " + line)
         return out
     vw = min(28, max(10, width - 62))
-    snap_w = max(12, width - (42 + vw))
+    snap_w = max(12, width - (43 + vw))
     out.append("%-9s %-*s %-6s %-6s %-7s %-9s %s"
                % ("MODE", vw, "VARIANT", "METHOD", "STATUS", "BYTES",
                   "VERDICT", "SNIPPET"))
-    out.append("-" * min(width, 42 + vw + snap_w))
+    out.append("-" * min(width, 43 + vw + snap_w))
     for r in rows:
         out.append("%-9s %-*s %-6s %-6s %-7s %-9s %s"
                    % (r["mode"], vw, fit(r["variant"], vw), r["method"],
@@ -1306,7 +1395,7 @@ def render(data, as_json, width=None):
             data["baseline"]["status"], data["baseline"]["bytes"],
             data["baseline"]["snippet"]), width)
     if not data["baseline"]["blocked"]:
-        emit(out, "[i] baseline already returns 2xx (nothing is being "
+        emit(out, "[i] baseline already returns 2xx/3xx (nothing is being "
              "blocked); BYPASS rows cannot be proven against it", width)
     if data["baseline"].get("challenge"):
         emit(out, "[!] baseline is a JS/CAPTCHA challenge (%s); rerun with "
@@ -1315,6 +1404,10 @@ def render(data, as_json, width=None):
     emit(out, '[*] control  GET -> %s / %d bytes  "%s"'
          % (data["control"]["status"], data["control"]["bytes"],
             data["control"]["snippet"]), width)
+    if data["control"]["status"] == 0:
+        emit(out, "[!] control failed (%s); NOTFOUND rows are unreliable and "
+             "soft-404 masking cannot be judged"
+             % (data["control"].get("error") or "no response"), width)
     if data["summary"]["masked"]:
         emit(out, "[!] soft-404 masking: control and baseline share status "
              "and body; DIFF rows are not evidence", width)
@@ -1349,7 +1442,8 @@ def render(data, as_json, width=None):
         emit(out, "[!] UNSTABLE rows: " + ", ".join(
             "%s/%s(%d)" % (r["mode"], r["variant"], r["status"]) for r in uns),
             width)
-    findings = [r for r in data["rows"] if r.get("finding")]
+    findings = [r for r in data["rows"]
+                if r.get("finding") and r["verdict"] == "BYPASS"]
     if findings:
         out.append("")
         out.extend(render_findings(findings, data["baseline"]["status"], width))
@@ -1719,9 +1813,52 @@ def welcome_menu(args):
         _alt_leave(full)
 
 
+def fatal_document(message, code, args=None):
+    """Fatal JSON document: same top-level fields as a normal one, ok=false."""
+    def opt(name, default=None):
+        return getattr(args, name, default) if args is not None else default
+    return {
+        "ok": False,
+        "fatal": True,
+        "error": message,
+        "exit": code,
+        "url": opt("url"),
+        "mode": opt("mode"),
+        "level": opt("level"),
+        "param": opt("param"),
+        "profile": opt("profile"),
+        "http2": opt("http2"),
+        "follow": opt("follow", 0) or 0,
+        "cookies": bool(opt("cookies", False)),
+        "max_body": opt("max_body"),
+        "challenge": None,
+        "payload": opt("payload"),
+        "baseline": None,
+        "control": None,
+        "rows": [],
+        "summary": None,
+    }
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """argparse that mirrors a fatal CLI error to stdout when --json is set."""
+
+    def __init__(self, *args, **kwargs):
+        self.json_argv = kwargs.pop("json_argv", [])
+        super().__init__(*args, **kwargs)
+
+    def error(self, message):
+        if "--json" in self.json_argv:
+            sys.stdout.write(json.dumps(fatal_document(message, 2)) + "\n")
+            sys.stdout.flush()
+        super().error(message)
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="403/WAF bypass sweep engine (raw socket request-target)")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = JsonArgumentParser(
+        description="403/WAF bypass sweep engine (raw socket request-target)",
+        json_argv=argv)
     ap.add_argument("-u", "--url", default=None, help="target URL")
     ap.add_argument("-V", "--version", action="store_true",
                     help="print banner and version")
@@ -1786,6 +1923,11 @@ def main(argv=None):
     ap.add_argument("--menu", action="store_true",
                     help="open the welcome menu")
     args = ap.parse_args(argv)
+    tls_order = {"TLSv1": 0, "TLSv1_1": 1, "TLSv1_2": 2, "TLSv1_3": 3}
+    if (args.tls_min and args.tls_max
+            and tls_order[args.tls_min] > tls_order[args.tls_max]):
+        ap.error("--tls-min %s is above --tls-max %s"
+                 % (args.tls_min, args.tls_max))
     if args.banner or args.version:
         sys.stdout.write(BANNER.lstrip("\n") + "\n")
         if args.version:
@@ -1804,11 +1946,19 @@ def main(argv=None):
         data, code = run(args)
     except ValueError as exc:
         sys.stderr.write("[x] %s\n" % exc)
+        if args.json:
+            sys.stdout.write(json.dumps(fatal_document(str(exc), 2, args)) + "\n")
         return 2
     except KeyboardInterrupt:
         sys.stderr.write("[x] interrupted\n")
+        if args.json:
+            sys.stdout.write(json.dumps(fatal_document("interrupted", 2, args))
+                             + "\n")
         return 2
     if data is None:
+        if args.json:
+            sys.stdout.write(json.dumps(
+                fatal_document(LAST_ERROR or "scan failed", code, args)) + "\n")
         return code
 
     text = render(data, args.json, term_width())

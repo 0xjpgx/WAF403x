@@ -23,6 +23,9 @@ python3 wafbypass.py -u https://target/submit --mode size --profile cloudflare \
     --payload "UNION SELECT 1" --repeat 3
 ```
 
+Exit codes: `0` = at least one confirmed BYPASS, `1` = sweep completed with no
+BYPASS, `2` = fatal (bad URL, baseline failed, solver failed).
+
 | Option | Default | Meaning |
 |---|---|---|
 | `-u/--url` | required | target URL (the only host ever contacted) |
@@ -80,8 +83,8 @@ with wrapped snippets. Findings with identical disclosure are grouped once
 Baseline is the un-obfuscated attack for the selected mode: raw payload in the
 query for `encoding`/`all`, the canonical urlencoded POST for `body`/`ctype`/
 `size`, the plain cookie for `cookie`, otherwise the URL as given. If the
-baseline already answers 2xx the engine prints
-`[i] baseline already returns 2xx (nothing is being blocked)`; a BYPASS cannot
+baseline already answers 2xx/3xx the engine prints
+`[i] baseline already returns 2xx/3xx (nothing is being blocked)`; a BYPASS cannot
 be proven against a permissive baseline. Control is a random nonexistent path
 on the same host, used as the soft-404 signature.
 
@@ -93,7 +96,7 @@ on the same host, used as the soft-404 signature.
 | `BLOCKED` | same status as baseline and body similarity >= 0.95 |
 | `NOTFOUND` | same status as control and body similarity >= 0.90 |
 | `CHALLENGE` | JS/CAPTCHA interstitial (`cf-mitigated`, "Just a moment", Turnstile, hCaptcha, ...) |
-| `BYPASS` | 2xx/3xx, non-empty body, similarity to baseline < 0.90, not control |
+| `BYPASS` | baseline blocked (not 2xx/3xx), response 2xx/3xx, non-empty body, similarity to baseline < 0.90, not control |
 | `DIFF` | anything else |
 | `UNSTABLE` | a BYPASS/DIFF candidate that changed status or body hash on re-send |
 
@@ -252,9 +255,34 @@ the TLS/HTTP fingerprint differs from the browser.
 
 `--follow N` chases up to N same-host redirects (cross-host targets are
 dropped), rewriting POST to GET on 301/302/303 and preserving method+body on
-307/308. `--cookies` keeps a per-run Set-Cookie jar, which is also what a
-minted challenge cookie needs. `--max-body BYTES` raises or lowers the
-response cap from the default 1 MiB.
+307/308. A followed row is labelled with the method of the **final hop** (a
+redirected HEAD shows `GET`). `--cookies` keeps a
+per-run Set-Cookie jar, which is also what a minted challenge cookie needs.
+`--max-body BYTES` raises or lowers the response cap from the default 1 MiB.
+
+## JSON output
+
+`--json` emits exactly one document on stdout. A normal scan starts with
+`"ok": true` and carries the top-level keys `url, mode, level, param, profile,
+http2, follow, cookies, max_body, challenge, payload, baseline, control, rows,
+summary`. Every element of `rows` has the same fixed key set, whatever the
+verdict:
+
+```
+variant, mode, method, status, bytes, verdict, snippet, impact,
+finding, error, retries, stable
+```
+
+`retries` is `0` and `stable` is `null` for rows the stability gate did not
+retry; a retried row carries the send count and `true`/`false`. A strict
+consumer can read any key on any row without switching on the verdict.
+
+A fatal scan (bad URL, baseline failure, fatal transport, bad CLI range such
+as `--tls-min` above `--tls-max`) emits `"ok": false`, `"fatal": true`,
+`"error": "<message>"`, `"exit": 2`, the same top-level fields with
+null/empty values, and `"rows": []`. Argument-parser failures with `--json`
+are mirrored to stdout in the same shape (the usage line still goes to
+stderr). Branch on `ok` instead of guessing from the key set.
 
 ## Limitations
 
@@ -262,6 +290,9 @@ response cap from the default 1 MiB.
   the stdlib `ssl` module (OpenSSL fixes both); `--ciphers`, `--tls-min`,
   `--tls-max` and `--alpn` change the cipher list, version and ALPN only, so
   a full JA3/JA4 match is impossible without vendoring a TLS stack.
+  `--tls-min` above `--tls-max` is rejected at argument parsing
+  (`--tls-min TLSv1_3 is above --tls-max TLSv1_2`) instead of reaching
+  OpenSSL's `NO_PROTOCOLS_AVAILABLE`.
 * CAPTCHA solving is delegated to the stealth browser; pure-image CAPTCHAs
   are not solved by the engine itself.
 * Response bodies are capped by `--max-body` (1 MiB default); headers by 64 KB.
