@@ -135,7 +135,7 @@ size      size-8192-ctl          POST   403     18     BLOCKED   403 Blocked by 
 size      size-65536             POST   403     18     BLOCKED   403 Blocked by WAF
 size      size-65536-ctl         POST   403     18     BLOCKED   403 Blocked by WAF
 
-[+] SUMMARY variants=72 bypass=12 blocked=56 notfound=3 diff=1 error=0 unstable=0
+[+] SUMMARY variants=75 bypass=12 blocked=59 notfound=0 diff=1 neutralized=0 passed=3 error=0 unstable=0
 [i] stability: 13/13 confirmed
 [+] BYPASS rows: path/double-slash(200), path/dot-segment(200), path/pct-dot(200), path/slash-to-pct2f(200), path/backslash(200), path/backslash-pct(200), path/dotdot-prefix(200), header/xff-127.0.0.1(200), header/xff-localhost(200), header/x-original-url(200), header/x-rewrite-url(200), method/method-OPTIONS(200)
 exit=0
@@ -174,7 +174,7 @@ encoding  enc-tab-space          GET    403     18     BLOCKED   403 Blocked by 
 encoding  enc-base64             GET    200     9      BYPASS    SEARCH OK
 encoding  enc-html-entity        GET    200     9      BYPASS    SEARCH OK
 
-[+] SUMMARY variants=12 bypass=7 blocked=5 notfound=0 diff=0 error=0 unstable=0
+[+] SUMMARY variants=15 bypass=7 blocked=5 notfound=0 diff=0 neutralized=0 passed=3 error=0 unstable=0
 [i] stability: 7/7 confirmed
 [+] BYPASS rows: encoding/enc-double-url(200), encoding/enc-uxxxx(200), encoding/enc-hex(200), encoding/enc-comment-space(200), encoding/enc-mysql-comment(200), encoding/enc-base64(200), encoding/enc-html-entity(200)
 exit=0
@@ -304,7 +304,7 @@ size      size-8192-ctl          POST   200     39     BLOCKED   <html><body><h1
 size      size-65536             POST   200     39     BLOCKED   <html><body><h1>home</h1></body></html>
 size      size-65536-ctl         POST   200     39     BLOCKED   <html><body><h1>home</h1></body></html>
 
-[+] SUMMARY variants=72 bypass=0 blocked=64 notfound=7 diff=1 error=0 unstable=0
+[+] SUMMARY variants=75 bypass=0 blocked=62 notfound=10 diff=1 neutralized=2 passed=0 error=0 unstable=0
 [i] stability: 1/1 confirmed
 [+] BYPASS rows: none
 exit=1
@@ -510,3 +510,50 @@ transcripts and the server log returns 0 for every file.
 | All 10 profiles x limits | 14 padded rows BYPASS 200, 14 offset-0 controls BLOCKED 403 |
 | py_compile clean | `py_compile_exit=0` |
 | No tracebacks | 0 matches in all captured logs |
+
+## Addendum 2026-11-23: why live sweeps returned bypass=0
+
+Live targets were re-probed and the blocker was named from its own bytes, not
+guessed. None of the previously swept targets had a rule to bypass.
+
+```
+$ curl -sS https://cdn.bmkg.go.id/
+status=403 bytes=111
+<?xml version='1.0' encoding='UTF-8'?><Error><Code>AccessDenied</Code><Message>Access denied.</Message></Error>
+x-guploader-uploadid: AFy3sg3APz1OO_o0Q2yOSE-t1hur3SFtFfD38w7GZNkRTxUgEJG2cUnJtyIof99fOTB0f5GNJLD-bznn5Y_0
+server: cloudflare
+```
+
+That 111-byte 403 is Google Cloud Storage refusing a bucket listing; no
+request transform changes a bucket policy. The engine now prints
+`[*] blocked by Google Cloud Storage AccessDenied` and the static-deny hint.
+
+Bali program hosts (48 from `https://bugbounty.baliprov.go.id/`, plus the 3
+`cdn-*` hosts): benign `?q=1` and `?q=' OR 1=1--` were sent to every host.
+`benign200_payload_blocked = 0`. No host on that program applies a rule to the
+query at all; the only 403s are CloudFront/S3 blanket denies
+(`[*] blocked by CloudFront 403`).
+
+Dotfile sweep, 51 hosts x 8 paths = 408 GETs: 16 responses were 200, all on
+`assessmentcenter-ng` (482 bytes) and `design` (89177 bytes), both SPA
+catch-alls serving index.html for every path, so no exposure.
+
+## Addendum 2026-11-23: CRS 4.30 PL1 rule gap proven in the lab
+
+`docker.io/owasp/modsecurity-crs:nginx` with `PARANOIA=1`, backend echo page.
+A numeric `Host` (127.0.0.1) alone fires rule 920350 for score 5, so every
+result looked blocked; `--host lab.example` removes it (`--host` is new).
+
+```
+$ curl -s -o /dev/null -w '%{http_code}\n' -H 'Host: lab.example' --get --data-urlencode "q=' OR 1=1--" http://127.0.0.1:8080/
+403                     # rule 942100 libinjection
+$ curl ... -H 'Host: lab.example' 'http://127.0.0.1:8080/item/1%27%20OR%201%3D1--'
+200                     # same payload in the path: not inspected at PL1
+/x/;id        200       # rce
+/x/{{7*7}}    200       # ssti
+/x/<script>   403       # xss rules do read REQUEST_URI
+```
+
+`encoding` mode now emits `enc-path-append`, `enc-path-segment`,
+`enc-path-double` and labels a passed-but-contentless row `PASSED` instead of
+`NOTFOUND` when the baseline was blocked.

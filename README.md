@@ -50,6 +50,9 @@ BYPASS, `2` = fatal (bad URL, baseline failed, solver failed).
 | `--solver-python` | `./.venv/bin/python` | interpreter that has `scrapling` installed |
 | `--solver-timeout` | 120 | seconds allowed for the browser challenge |
 | `--profile` | `generic` | vendor size limits (table below) |
+| `--connect-to` | none | reconnect the socket to `HOST[:PORT]` while Host and SNI keep the URL identity (origin-IP and vhost testing) |
+| `--host` | none | override the `Host` header (SNI follows it unless `--sni` is set) |
+| `--sni` | URL host | override the TLS SNI name |
 | `--param` | `q` | query parameter replaced or appended |
 | `--payload` | `' OR 1=1--` | literal payload |
 | `--preset` | none | `sqli`, `xss`, `lfi`, `rce`, `ssrf`, `ssti` |
@@ -104,13 +107,35 @@ on the same host, used as the soft-404 signature.
 |---|---|
 | `ERROR` | no response |
 | `BLOCKED` | same status as baseline and body similarity >= 0.95 |
-| `NOTFOUND` | same status as control and body similarity >= 0.90 |
+| `NOTFOUND` | same status as control and body similarity >= 0.90, with a permissive baseline |
+| `PASSED` | same as `NOTFOUND` but the baseline was blocked: the payload got past the rule, the app served its normal page (WAF skip, no content proof) |
+| `NEUTRALIZED` | `hex`/`base64` encoding returned 2xx: the rule did not match because no HTTP parser turns those tokens back into the payload |
 | `CHALLENGE` | JS/CAPTCHA interstitial (`cf-mitigated`, "Just a moment", Turnstile, hCaptcha, ...) |
 | `BYPASS` | baseline blocked (not 2xx/3xx), response 2xx/3xx, non-empty body, similarity to baseline < 0.90, not control |
 | `DIFF` | anything else |
 | `UNSTABLE` | a BYPASS/DIFF candidate that changed status or body hash on re-send |
 
 Similarity is `difflib.SequenceMatcher` over the first 4000 decoded chars.
+
+When the baseline is blocked the report names the blocker from the baseline
+bytes and headers, e.g. `[*] blocked by nginx static deny`,
+`Google Cloud Storage AccessDenied`, `CloudFront 403`,
+`Cloudflare 403 (managed rule or firewall rule)`. For a static deny
+(`location` match, bucket policy, blanket edge deny) every path variant is
+hopeless, and the report says so instead of implying the sweep failed: the
+payload families (`--mode encoding|body|cookie`) are the ones that can still
+skip a rule. A baseline that answers 2xx gets
+`[!] baseline is 2xx: path/header/method/ctype rows cannot prove a bypass`.
+
+## Payload in the path
+
+`encoding` mode also puts the payload into the routed path, which is a real
+rule gap: CRS 4.30 PL1 runs libinjection on `ARGS` only, so
+`/item/1%27%20OR%201%3D1--` and `/x/;id` reach nginx+ModSecurity as 200 while
+`?q=' OR 1=1--` is 403 under the same `Host`. Variants: `enc-path-append`
+(`/item/1'`), `enc-path-segment` (`/item/1/'`), `enc-path-double` (double
+encoded). They classify as `PASSED`/`NOTFOUND`/`BYPASS` depending on what the
+app answers, never as a finding without content.
 
 ## Impact and findings
 

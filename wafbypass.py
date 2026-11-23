@@ -108,15 +108,17 @@ PROFILE_LIMITS = {
 # target / request
 # --------------------------------------------------------------------------
 class Target(object):
-    __slots__ = ("scheme", "host", "port", "host_header", "path", "query")
+    __slots__ = ("scheme", "host", "port", "host_header", "path", "query",
+                 "sni")
 
-    def __init__(self, scheme, host, port, host_header, path, query):
+    def __init__(self, scheme, host, port, host_header, path, query, sni=None):
         self.scheme = scheme
         self.host = host
         self.port = port
         self.host_header = host_header
         self.path = path
         self.query = query
+        self.sni = sni or host
 
     @property
     def target(self):
@@ -338,7 +340,7 @@ def send_raw(t, raw, timeout, opts=None, method="GET"):
         sock = socket.create_connection((t.host, t.port), timeout=timeout)
         sock.settimeout(timeout)
         if t.scheme == "https":
-            sock = _tls_context(opts).wrap_socket(sock, server_hostname=t.host)
+            sock = _tls_context(opts).wrap_socket(sock, server_hostname=t.sni)
         sock.sendall(raw)
         data, timed_out = _recv_all(sock, opts.get("max_body", MAX_BODY))
     except (socket.timeout, OSError, ssl.SSLError) as exc:
@@ -368,7 +370,7 @@ def send_h2(t, v, headers, timeout, opts):
         sock.settimeout(timeout)
         if t.scheme == "https":
             ctx = _tls_context(opts, ["h2"])
-            sock = ctx.wrap_socket(sock, server_hostname=t.host)
+            sock = ctx.wrap_socket(sock, server_hostname=t.sni)
             negotiated = sock.selected_alpn_protocol()
             if negotiated != "h2":
                 return Response(0, {}, b"",
@@ -753,6 +755,53 @@ def challenge_kind(resp):
     return None
 
 
+STATIC_DENY = ("nginx static deny", "Apache static deny",
+               "AWS S3 AccessDenied", "Google Cloud Storage AccessDenied",
+               "CloudFront 403", "AmazonS3 403")
+
+
+def blocker_kind(resp, path):
+    """Name what produced a blocked baseline, cheaply, from its own bytes.
+
+    Returns a label; only STATIC_DENY labels mean every path variant is
+    hopeless, because the block is a location/location-conf match or a bucket
+    policy, not a rule that reads the URL.
+    """
+    if resp.status == 0:
+        return "no response"
+    kind = challenge_kind(resp)
+    if kind:
+        return "challenge (" + kind + ")"
+    if resp.status not in (400, 401, 403, 406, 418, 451, 501):
+        return None
+    low = resp.body[:4000].lower()
+    hdr = resp.headers
+    if b"<code>accessdenied</code>" in low:
+        if "x-guploader-uploadid" in hdr:
+            return "Google Cloud Storage AccessDenied"
+        if hdr.get("server", "").lower().startswith("amazons3"):
+            return "AWS S3 AccessDenied"
+        return "object storage AccessDenied"
+    if "x-amz-cf-id" in hdr and resp.status in (403, 404):
+        return "CloudFront 403"
+    if hdr.get("server", "").startswith("AmazonS3") and resp.status == 403:
+        return "AmazonS3 403"
+    if "cf-ray" in hdr and resp.status == 403:
+        return "Cloudflare 403 (managed rule or firewall rule)"
+    if "x-amzn-waf-action" in hdr:
+        return "AWS WAF 403"
+    if resp.status == 403 and b"<center>nginx</center>" in low:
+        if path.startswith("/.") or "/." in path:
+            return "nginx static deny"
+        return "nginx 403"
+    srv = hdr.get("server", "")
+    if resp.status == 403 and srv.startswith("Apache"):
+        return "Apache static deny"
+    if b"imunify" in low or "imunify360" in str(hdr).lower():
+        return "Imunify360 block"
+    return None
+
+
 def classify(resp, base, ctrl):
     if resp.status == 0:
         return "ERROR"
@@ -764,7 +813,10 @@ def classify(resp, base, ctrl):
         return "BLOCKED"
     sim_ctrl = similarity(txt, ctrl.text())
     if resp.status == ctrl.status and sim_ctrl >= 0.90:
-        return "NOTFOUND"
+        # Same shape as the control page: no content proof. When the baseline
+        # was blocked, the payload still got past the rule, which is the only
+        # honest label for a WAF skip on a route the app does not serve.
+        return "PASSED" if not (200 <= base.status < 400) else "NOTFOUND"
     # A bypass needs something blocked to bypass: with a permissive baseline
     # (2xx/3xx) a different 2xx body is an echo/routing differential, not a
     # WAF skip. Size pairs are promoted separately in run().
@@ -1058,8 +1110,16 @@ def encode_payloads(payload):
 
 def encoding_variants(t, param, payload):
     out = []
-    for name, enc in encode_payloads(payload):
-        q = inject_query(t.query, param, enc)
+    # Path-segment injection: CRS 4.30 PL1 runs libinjection on ARGS only, so
+    # SQLi/RCE/SSTI placed in the path segment of a routed URL is not scored.
+    enc = quote(payload, safe="")
+    out.append(mk("encoding", "enc-path-append", "GET", t.path + enc))
+    out.append(mk("encoding", "enc-path-segment", "GET",
+                  t.path.rstrip("/") + "/" + enc))
+    out.append(mk("encoding", "enc-path-double", "GET",
+                  t.path + quote(enc, safe="")))
+    for name, e in encode_payloads(payload):
+        q = inject_query(t.query, param, e)
         out.append(mk("encoding", "enc-" + name, "GET", t.path + "?" + q))
     return out
 
@@ -1141,6 +1201,7 @@ LEVELS = {
     "urlencoded": 1, "json": 2, "append-param": 2,
     "multipart": 3, "hpp": 3, "semicolon": 3, "chunked": 4,
 
+    "enc-path-append": 1, "enc-path-segment": 1, "enc-path-double": 3,
     "enc-raw": 1, "enc-url": 1, "enc-double-url": 2, "enc-case-toggle": 2,
     "enc-plus-space": 2, "enc-tab-space": 2, "enc-comment-space": 2,
     "enc-uxxxx": 3, "enc-hex": 3, "enc-mysql-comment": 3,
@@ -1297,8 +1358,47 @@ def _fail(message):
     return None, 2
 
 
+def _apply_connect(t, spec):
+    """Point the socket at spec while Host/SNI keep the URL identity."""
+    spec = spec.strip()
+    port = None
+    if spec.startswith("["):              # [::1] or [::1]:8443
+        end = spec.find("]")
+        if end < 0:
+            raise ValueError("bad --connect-to value: %r" % spec)
+        host, rest = spec[1:end], spec[end + 1:]
+        if rest:
+            if not rest.startswith(":") or not rest[1:].isdigit():
+                raise ValueError("bad --connect-to port: %r" % spec)
+            port = rest[1:]
+    else:
+        host, sep, maybe = spec.rpartition(":")
+        if not sep or not maybe.isdigit():
+            host, port = spec, None
+        else:
+            port = maybe
+    if not host:
+        raise ValueError("bad --connect-to value: %r" % spec)
+    t.host = host
+    if port:
+        t.port = int(port)
+
+
 def run(args):
     t = parse_url(args.url)
+    if args.connect_to:
+        try:
+            _apply_connect(t, args.connect_to)
+        except ValueError as exc:
+            return _fail(str(exc))
+    if args.host:
+        t.host_header = args.host
+    if args.sni:
+        t.sni = args.sni
+    elif args.host and not args.host.replace(".", "").replace(":", "").isdigit():
+        t.sni = args.host.rsplit(":", 1)[0]
+    if args.http3 and (args.connect_to or args.host):
+        return _fail("--connect-to/--host cannot be combined with --http3")
     if args.preset:
         payload = PRESETS[args.preset]
     elif args.payload is not None:
@@ -1412,6 +1512,7 @@ def run(args):
     base = fetch(t, base_v, timeout, 0.0, opts, jar, jar_lock)
     if base.status == 0:
         return _fail("baseline failed: %s" % (base.error or "no response"))
+    blocked_by = blocker_kind(base, base_v["target"].split("?")[0])
 
     ctrl_path = "/" + "".join(random.choice(string.ascii_lowercase + string.digits)
                               for _ in range(12))
@@ -1433,9 +1534,17 @@ def run(args):
     with ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(work, list(enumerate(variants))))
 
+    # These encodings turn the payload into text no app parser decodes, so a
+    # 2xx only proves the rule did not match syntax the app can use either.
+    MUTATING = ("enc-hex", "enc-base64")
+
     rows = []
     for v, resp in results:
         verdict = classify(resp, base, ctrl)
+        if (v["name"] in MUTATING and 200 <= resp.status < 400
+                and verdict in ("NOTFOUND", "DIFF", "BLOCKED", "PASSED")
+                and not challenge_kind(resp)):
+            verdict = "NEUTRALIZED"
         rows.append({
             "variant": v["name"],
             "mode": v["mode"],
@@ -1543,7 +1652,8 @@ def run(args):
                 impact[row["impact"]] += 1
 
     counts = {"BYPASS": 0, "BLOCKED": 0, "NOTFOUND": 0, "DIFF": 0,
-              "ERROR": 0, "UNSTABLE": 0, "CHALLENGE": 0}
+              "ERROR": 0, "UNSTABLE": 0, "CHALLENGE": 0, "NEUTRALIZED": 0,
+              "PASSED": 0}
     for r in rows:
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
 
@@ -1577,6 +1687,7 @@ def run(args):
         "max_body": opts["max_body"],
         "challenge": challenge,
         "payload": payload,
+        "blocked_by": blocked_by,
         "baseline": {"method": getattr(base, "final_method", base_v["method"]),
                      "target": base_v["target"],
                      "status": base.status, "bytes": base.length,
@@ -1736,6 +1847,17 @@ def render(data, as_json, width=None):
     if not data["baseline"]["blocked"]:
         emit(out, "[i] baseline already returns 2xx/3xx (nothing is being "
              "blocked); BYPASS rows cannot be proven against it", width)
+    if data.get("blocked_by"):
+        emit(out, "[*] blocked by %s" % data["blocked_by"], width)
+        if data["blocked_by"] in STATIC_DENY:
+            emit(out, "[!] static deny: no path/encoding variant can bypass a "
+                 "location or bucket match; test a rule-backed endpoint with "
+                 "--mode encoding|body|cookie", width)
+    if not data["baseline"]["blocked"] and data["mode"] in (
+            "path", "header", "method", "ctype", "h2", "proto", "all"):
+        emit(out, "[!] baseline is 2xx: path/header/method/ctype rows cannot "
+             "prove a bypass; use --mode encoding|body|cookie so the payload "
+             "is in the baseline", width)
     if data["baseline"].get("challenge"):
         emit(out, "[!] baseline is a JS/CAPTCHA challenge (%s); rerun with "
              "--solve-challenge to mint cookies in a browser"
@@ -1756,9 +1878,10 @@ def render(data, as_json, width=None):
     s = data["summary"]
     st = s["stability"]
     emit(out, "[+] SUMMARY variants=%d bypass=%d blocked=%d notfound=%d "
-         "diff=%d error=%d unstable=%d challenge=%d"
+         "diff=%d neutralized=%d passed=%d error=%d unstable=%d challenge=%d"
          % (s["variants"], s["BYPASS"], s["BLOCKED"], s["NOTFOUND"],
-            s["DIFF"], s["ERROR"], s["UNSTABLE"], s["CHALLENGE"]), width)
+            s["DIFF"], s["NEUTRALIZED"], s["PASSED"], s["ERROR"],
+            s["UNSTABLE"], s["CHALLENGE"]), width)
     if s["repeat"]:
         out.append("[i] stability: %d/%d confirmed"
                    % (st["confirmed"], st["retried"]))
@@ -2272,6 +2395,13 @@ def main(argv=None):
                     help="skip the benign-twin impact oracle for BYPASS rows")
     ap.add_argument("--repeat", type=int, default=2,
                     help="stability re-sends per BYPASS/DIFF candidate (default 2)")
+    ap.add_argument("--connect-to", default=None, metavar="HOST[:PORT]",
+                    help="connect here while keeping the URL host in Host/SNI "
+                         "(origin-IP and vhost testing)")
+    ap.add_argument("--host", default=None, metavar="NAME",
+                    help="override the Host header")
+    ap.add_argument("--sni", default=None, metavar="NAME",
+                    help="override the TLS SNI/verification name")
     ap.add_argument("--param", default="q", help="query parameter to inject (default: q)")
     ap.add_argument("--payload", default=None, help="payload string")
     ap.add_argument("--preset", default=None, choices=sorted(PRESETS),
