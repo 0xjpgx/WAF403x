@@ -133,7 +133,7 @@ async def run(req):
         verify_mode=ssl.CERT_NONE,
         max_data=int(req.get("max_data") or 1048576),
         max_stream_data=int(req.get("max_stream_data") or 1048576),
-        idle_timeout=max(10.0, timeout + 10.0),
+        idle_timeout=max(2.0, timeout + 1.0),
     )
     config.server_name = host
     ticket = load_ticket(ticket_path) if early and ticket_path else None

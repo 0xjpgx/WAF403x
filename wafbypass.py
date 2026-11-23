@@ -43,6 +43,7 @@ import signal
 import socket
 import ssl
 import string
+import struct
 import subprocess
 import sys
 import textwrap
@@ -410,6 +411,128 @@ def _h3_python(args):
     return path
 
 
+def _resolv_nameservers():
+    servers = []
+    try:
+        with open("/etc/resolv.conf", "r", encoding="utf-8",
+                  errors="replace") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    servers.append(parts[1].split("%", 1)[0])
+    except OSError:
+        pass
+    if not servers:
+        servers = ["127.0.0.1"]
+    return servers[:3]
+
+
+def _dns_read_name(data, offset):
+    labels = []
+    end = offset
+    jumped = False
+    seen = set()
+    while True:
+        if offset >= len(data):
+            return None, end
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            if not jumped:
+                end = offset
+            break
+        if length & 0xC0 == 0xC0:
+            if offset + 1 >= len(data):
+                return None, end
+            ptr = ((length & 0x3F) << 8) | data[offset + 1]
+            if not jumped:
+                end = offset + 2
+            jumped = True
+            if ptr in seen or ptr >= len(data):
+                return None, end
+            seen.add(ptr)
+            offset = ptr
+            continue
+        offset += 1
+        if offset + length > len(data):
+            return None, end
+        labels.append(data[offset:offset + length].decode("latin-1"))
+        offset += length
+        if not jumped:
+            end = offset
+    return ".".join(labels), end
+
+
+def h3_dns_alpn(host, timeout=2.5):
+    """Advertised ALPN from the HTTPS/SVCB RR (type 65): list or None.
+
+    A list means the record exists (possibly with no alpn); None means no
+    record or no resolver answered. Pure stdlib UDP, no dig shell-out.
+    """
+    qid = random.randint(0, 0xFFFF)
+    qname = b"".join(bytes([len(label)]) + label.encode("latin-1")
+                     for label in host.split(".") if label) + b"\x00"
+    query = (struct.pack("!HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+             + qname + struct.pack("!HH", 65, 1))
+    for server in _resolv_nameservers():
+        family = socket.AF_INET6 if ":" in server else socket.AF_INET
+        sock = None
+        try:
+            sock = socket.socket(family, socket.SOCK_DGRAM)
+            sock.settimeout(timeout)
+            sock.sendto(query, (server, 53))
+            data, _ = sock.recvfrom(4096)
+        except OSError:
+            continue
+        finally:
+            if sock is not None:
+                sock.close()
+        if len(data) < 12:
+            continue
+        rid, flags, qd, an, ns, ar = struct.unpack("!HHHHHH", data[:12])
+        if rid != qid or not (flags & 0x8000) or (flags & 0x000F) != 0:
+            continue
+        offset = 12
+        for _ in range(qd):
+            _, offset = _dns_read_name(data, offset)
+            offset += 4
+        found = False
+        alpns = []
+        for _ in range(an):
+            _, offset = _dns_read_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            rtype, rclass, ttl, rdlen = struct.unpack(
+                "!HHIH", data[offset:offset + 10])
+            offset += 10
+            rdata_end = offset + rdlen
+            if rdata_end > len(data):
+                break
+            if rtype == 65:
+                found = True
+                pos = offset + 2
+                _, pos = _dns_read_name(data, pos)
+                while pos + 4 <= rdata_end:
+                    key, vlen = struct.unpack("!HH", data[pos:pos + 4])
+                    pos += 4
+                    if pos + vlen > rdata_end:
+                        break
+                    value = data[pos:pos + vlen]
+                    pos += vlen
+                    if key == 1:
+                        i = 0
+                        while i < len(value):
+                            ln = value[i]
+                            i += 1
+                            if i + ln > len(value):
+                                break
+                            alpns.append(value[i:i + ln].decode("latin-1"))
+                            i += ln
+            offset = rdata_end
+        return alpns if found else None
+    return None
+
+
 def check_h3_backend(python):
     """None when aioquic imports, else one actionable line (no traceback)."""
     if not os.path.exists(python):
@@ -438,11 +561,12 @@ def _h3_ticket_path(t):
 
 def send_h3(t, v, headers, timeout, opts, method="GET"):
     worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "h3.py")
+    req_timeout = opts.get("h3_timeout_cap") or timeout
     request = {
         "url": "%s://%s%s" % (t.scheme, t.host_header, v["target"]),
         "method": method,
         "headers": [[k, val] for k, val in headers.items()],
-        "timeout": timeout,
+        "timeout": req_timeout,
         "max_body": opts.get("max_body", MAX_BODY),
         "order": opts.get("h3_order", "chrome"),
         "max_data": opts.get("h3_max_data"),
@@ -456,10 +580,12 @@ def send_h3(t, v, headers, timeout, opts, method="GET"):
         proc = subprocess.run(
             [opts["h3_python"], worker],
             input=json.dumps(request).encode("utf-8"),
-            capture_output=True, timeout=timeout + 12)
+            capture_output=True, timeout=req_timeout + 5)
     except subprocess.TimeoutExpired:
-        return Response(0, {}, b"",
-                        "h3 backend timeout after %.0fs" % (timeout + 12),
+        message = ("h3 not advertised (no HTTPS RR); no QUIC response"
+                   if opts.get("h3_unknown")
+                   else "h3: no QUIC response (host may not offer h3)")
+        return Response(0, {}, b"", message,
                         final_method=method, proto="none")
     except OSError as exc:
         return Response(0, {}, b"", "h3 backend error: %s" % exc,
@@ -471,7 +597,15 @@ def send_h3(t, v, headers, timeout, opts, method="GET"):
         return Response(0, {}, b"", "h3 worker bad output: %r" % out[:120],
                         final_method=method, proto="none")
     if doc.get("error"):
-        return Response(0, {}, b"", "h3: %s" % doc["error"],
+        error = doc["error"]
+        if error == "timeout" or (opts.get("h3_unknown")
+                                  and error.startswith("ConnectionError")):
+            error = ("h3 not advertised (no HTTPS RR); no QUIC response"
+                     if opts.get("h3_unknown")
+                     else "h3: no QUIC response (host may not offer h3)")
+        else:
+            error = "h3: %s" % error
+        return Response(0, {}, b"", error,
                         final_method=method, proto="none")
     status = doc.get("status")
     if status is None:
@@ -516,6 +650,11 @@ def _send_once(t, v, timeout, opts, cookie_hdr):
         headers["Cookie"] = cookie_hdr
     proto = v.get("proto")
     if proto == "h3" or (proto is None and opts.get("http3")):
+        if opts.get("h3_skip"):
+            return Response(0, {}, b"",
+                            "%s (skipped; --h3-force to try)"
+                            % opts["h3_skip"],
+                            final_method=v["method"], proto="none")
         return send_h3(t, v, headers, timeout, opts, method=v["method"])
     if proto == "h2":
         return send_h2(t, v, headers, timeout, opts)
@@ -1195,6 +1334,8 @@ def run(args):
     need_h3 = bool(args.http3) or (protocols is not None and "h3" in protocols)
 
     timeout = max(0.5, float(args.timeout))
+    h3_alpn = None
+    h3_skip = None
     threads = max(1, int(args.threads))
     delay = max(0.0, float(args.delay or 0.0))
     opts = {
@@ -1216,6 +1357,15 @@ def run(args):
         backend_error = check_h3_backend(opts["h3_python"])
         if backend_error:
             return _fail(backend_error)
+        if not args.h3_force:
+            h3_alpn = h3_dns_alpn(t.host)
+            if h3_alpn is not None and "h3" not in h3_alpn:
+                h3_skip = ("h3 not advertised: host advertises alpn="
+                           + (",".join(h3_alpn) if h3_alpn else "<empty>"))
+                opts["h3_skip"] = h3_skip
+            elif h3_alpn is None:
+                opts["h3_unknown"] = True
+                opts["h3_timeout_cap"] = min(timeout, 2.5)
     jar = {} if args.cookies else None
     jar_lock = threading.Lock()
     challenge = None
@@ -1418,6 +1568,9 @@ def run(args):
         "protocols": protocols,
         "h3_order": opts["h3_order"],
         "h3_0rtt": opts["h3_0rtt"],
+        "h3_alpn": h3_alpn,
+        "h3_skip": h3_skip,
+        "h3_unknown": bool(opts.get("h3_unknown")),
         "follow": opts["follow"],
         "cookies": jar is not None,
         "max_body": opts["max_body"],
@@ -1559,6 +1712,16 @@ def render(data, as_json, width=None):
     elif data["follow"] or data["cookies"]:
         emit(out, "[*] transport h1 follow=%d cookies=%s"
              % (data["follow"], data["cookies"]), width)
+    if data.get("h3_alpn") is not None:
+        emit(out, "[*] h3 preflight: HTTPS RR alpn=%s"
+             % (",".join(data["h3_alpn"]) if data["h3_alpn"] else "<empty>"),
+             width)
+    if data.get("h3_skip"):
+        emit(out, "[!] %s (skipping QUIC; --h3-force to try)"
+             % data["h3_skip"], width)
+    elif data.get("h3_unknown"):
+        emit(out, "[*] h3 preflight: no HTTPS RR (attempting with a short cap)",
+             width)
     if data.get("challenge"):
         ch = data["challenge"]
         emit(out, "[*] challenge solver cookies=%d status=%s title=%r solved=%s"
@@ -2007,6 +2170,9 @@ def fatal_document(message, code, args=None):
         "protocols": parse_protocols(opt("protocols")) if opt("protocols") else None,
         "h3_order": opt("h3_order"),
         "h3_0rtt": bool(opt("h3_0rtt", False)),
+        "h3_alpn": None,
+        "h3_skip": None,
+        "h3_unknown": False,
         "follow": opt("follow", 0) or 0,
         "cookies": bool(opt("cookies", False)),
         "max_body": opt("max_body"),
@@ -2070,6 +2236,8 @@ def main(argv=None):
                     help="QUIC initial_max_stream_data_* (aioquic default 1048576)")
     ap.add_argument("--h3-0rtt", action="store_true",
                     help="try 0-RTT using a cached session ticket")
+    ap.add_argument("--h3-force", action="store_true",
+                    help="skip the HTTPS/SVCB preflight and try QUIC anyway")
     ap.add_argument("--follow", type=int, default=0, metavar="N",
                     help="follow up to N same-host redirects (default 0)")
     ap.add_argument("--cookies", action="store_true",

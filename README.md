@@ -39,6 +39,7 @@ BYPASS, `2` = fatal (bad URL, baseline failed, solver failed).
 | `--h3-max-data` | aioquic default | QUIC `initial_max_data` |
 | `--h3-max-stream-data` | aioquic default | QUIC `initial_max_stream_data_*` |
 | `--h3-0rtt` | off | try 0-RTT with a cached session ticket |
+| `--h3-force` | off | skip the HTTPS/SVCB preflight and try QUIC anyway |
 | `--follow` | `0` | follow up to N same-host redirects |
 | `--cookies` | off | keep a Set-Cookie jar for the whole run |
 | `--max-body` | 1048576 | response body cap in bytes |
@@ -254,6 +255,14 @@ h3 backend missing: aioquic not importable under ./.venv/bin/python (...);
 install with: python3 -m venv .venv && .venv/bin/pip install aioquic
 ```
 
+Before the first QUIC attempt the engine queries the target's HTTPS/SVCB RR
+(type 65) over UDP from the `/etc/resolv.conf` nameservers (stdlib only, no
+`dig`). A record whose `alpn` lacks `h3` skips the QUIC attempt and reports
+`h3 not advertised: host advertises alpn="h2"`; no record or no resolver answer
+attempts with a short cap and reports a silent handshake as
+`h3: no QUIC response (host may not offer h3)`. `--h3-force` bypasses the
+preflight and tries QUIC anyway.
+
 `--http3` switches the whole run (baseline, control, every variant) to QUIC v1
 with ALPN `h3`. `--mode proto --protocols h1,h2,h3` (or bare
 `--protocols h1,h2,h3`) replays the identical GET across the selected
@@ -313,8 +322,9 @@ per-run Set-Cookie jar, which is also what a minted challenge cookie needs.
 
 `--json` emits exactly one document on stdout. A normal scan starts with
 `"ok": true` and carries the top-level keys `url, mode, level, param, profile,
-http2, http3, protocols, h3_order, h3_0rtt, follow, cookies, max_body,
-challenge, payload, baseline, control, rows, summary`. Every element of `rows` has the same fixed key set, whatever the
+http2, http3, protocols, h3_order, h3_0rtt, h3_alpn, h3_skip, h3_unknown,
+follow, cookies, max_body, challenge, payload, baseline, control, rows,
+summary`. Every element of `rows` has the same fixed key set, whatever the
 verdict:
 
 ```
