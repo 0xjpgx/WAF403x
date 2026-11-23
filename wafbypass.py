@@ -145,10 +145,10 @@ def parse_url(url):
 
 class Response(object):
     __slots__ = ("status", "headers", "body", "error", "cookies", "hops",
-                 "final_method")
+                 "final_method", "proto")
 
     def __init__(self, status, headers, body, error=None, cookies=None, hops=0,
-                 final_method=None):
+                 final_method=None, proto="h1"):
         self.status = status
         self.headers = headers
         self.body = body
@@ -156,6 +156,7 @@ class Response(object):
         self.cookies = cookies or []
         self.hops = hops
         self.final_method = final_method
+        self.proto = proto
 
     def text(self):
         return self.body[:SIM_CHARS * 4].decode("utf-8", "replace")[:SIM_CHARS]
@@ -347,8 +348,10 @@ def send_raw(t, raw, timeout, opts=None, method="GET"):
                 sock.close()
             except OSError:
                 pass
-    return parse_response(data, opts.get("max_body", MAX_BODY),
+    resp = parse_response(data, opts.get("max_body", MAX_BODY),
                           timed_out=timed_out, method=method)
+    resp.proto = "h1"
+    return resp
 
 
 def send_h2(t, v, headers, timeout, opts):
@@ -368,12 +371,13 @@ def send_h2(t, v, headers, timeout, opts):
             if sock.selected_alpn_protocol() != "h2":
                 return Response(0, {}, b"",
                                 "ALPN negotiated %r, not h2"
-                                % sock.selected_alpn_protocol())
+                                % sock.selected_alpn_protocol(), proto="h2")
         status, hlist, body, err = h2.request(
             sock, v["method"], wire_safe(v["target"]), hdrs, v["body"],
             scheme=t.scheme, profile=profile, order=order, priority=priority)
     except (socket.timeout, OSError, ssl.SSLError, ValueError) as exc:
-        return Response(0, {}, b"", "%s: %s" % (type(exc).__name__, exc))
+        return Response(0, {}, b"", "%s: %s" % (type(exc).__name__, exc),
+                        proto="h2")
     finally:
         if sock is not None:
             try:
@@ -381,7 +385,7 @@ def send_h2(t, v, headers, timeout, opts):
             except OSError:
                 pass
     if err:
-        return Response(0, {}, b"", err)
+        return Response(0, {}, b"", err, proto="h2")
     body = body[:opts.get("max_body", MAX_BODY)]
     out_headers = {}
     cookies = []
@@ -390,7 +394,96 @@ def send_h2(t, v, headers, timeout, opts):
         out_headers[key] = value
         if key == "set-cookie":
             cookies.append(value)
-    return Response(status, out_headers, body, cookies=cookies)
+    return Response(status, out_headers, body, cookies=cookies, proto="h2")
+
+
+H3_ORDERS = ("chrome", "firefox", "safari")
+
+
+def _h3_python(args):
+    path = getattr(args, "h3_python", None)
+    if not path:
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             ".venv", "bin", "python")
+        path = local if os.path.exists(local) else sys.executable
+    return path
+
+
+def check_h3_backend(python):
+    """None when aioquic imports, else one actionable line (no traceback)."""
+    if not os.path.exists(python):
+        return ("h3 backend missing: no interpreter at %s; install with: "
+                "python3 -m venv .venv && .venv/bin/pip install aioquic"
+                % python)
+    try:
+        proc = subprocess.run([python, "-c", "import aioquic"],
+                              capture_output=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return "h3 backend missing: %s (%s)" % (python, exc)
+    if proc.returncode != 0:
+        lines = (proc.stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        detail = lines[-1] if lines else "import failed"
+        return ("h3 backend missing: aioquic not importable under %s (%s); "
+                "install with: python3 -m venv .venv && "
+                ".venv/bin/pip install aioquic" % (python, detail))
+    return None
+
+
+def _h3_ticket_path(t):
+    safe = re.sub(r"[^A-Za-z0-9.-]", "_", t.host)
+    return os.path.join(os.path.expanduser("~/.cache/wafbypass"),
+                        "h3-%s.ticket" % safe)
+
+
+def send_h3(t, v, headers, timeout, opts, method="GET"):
+    worker = os.path.join(os.path.dirname(os.path.abspath(__file__)), "h3.py")
+    request = {
+        "url": "%s://%s%s" % (t.scheme, t.host_header, v["target"]),
+        "method": method,
+        "headers": [[k, val] for k, val in headers.items()],
+        "timeout": timeout,
+        "max_body": opts.get("max_body", MAX_BODY),
+        "order": opts.get("h3_order", "chrome"),
+        "max_data": opts.get("h3_max_data"),
+        "max_stream_data": opts.get("h3_max_stream_data"),
+        "early_data": bool(opts.get("h3_0rtt")),
+        "ticket_path": _h3_ticket_path(t) if opts.get("h3_0rtt") else "",
+    }
+    if v.get("body"):
+        request["body_b64"] = base64.b64encode(v["body"]).decode("ascii")
+    try:
+        proc = subprocess.run(
+            [opts["h3_python"], worker],
+            input=json.dumps(request).encode("utf-8"),
+            capture_output=True, timeout=timeout + 12)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Response(0, {}, b"", "h3 backend error: %s" % exc,
+                        final_method=method, proto="h3")
+    out = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    try:
+        doc = json.loads(out.splitlines()[-1]) if out else {}
+    except ValueError:
+        return Response(0, {}, b"", "h3 worker bad output: %r" % out[:120],
+                        final_method=method, proto="h3")
+    if doc.get("error"):
+        return Response(0, {}, b"", "h3: %s" % doc["error"],
+                        final_method=method, proto="h3")
+    status = doc.get("status")
+    if status is None:
+        return Response(0, {}, b"", "h3: no :status in response",
+                        final_method=method, proto="h3")
+    out_headers = {}
+    cookies = []
+    for name, value in doc.get("headers") or []:
+        key = str(name).lower()
+        out_headers[key] = value
+        if key == "set-cookie":
+            cookies.append(value)
+    body = base64.b64decode(doc.get("body_b64") or "")
+    if len(body) > opts.get("max_body", MAX_BODY):
+        body = body[:opts.get("max_body", MAX_BODY)]
+    return Response(int(status), out_headers, body, cookies=cookies,
+                    final_method=method, proto="h3")
 
 
 def _jar_header(jar):
@@ -416,6 +509,15 @@ def _send_once(t, v, timeout, opts, cookie_hdr):
     headers = dict(v["headers"])
     if cookie_hdr and not any(k.lower() == "cookie" for k in headers):
         headers["Cookie"] = cookie_hdr
+    proto = v.get("proto")
+    if proto == "h3" or (proto is None and opts.get("http3")):
+        return send_h3(t, v, headers, timeout, opts, method=v["method"])
+    if proto == "h2":
+        return send_h2(t, v, headers, timeout, opts)
+    if proto == "h1":
+        raw = build_request(t, v["method"], v["target"], headers, v["body"],
+                            opts.get("ua", UA_DEFAULT))
+        return send_raw(t, raw, timeout, opts, method=v["method"])
     if opts["http2"] != "off":
         return send_h2(t, v, headers, timeout, opts)
     raw = build_request(t, v["method"], v["target"], headers, v["body"],
@@ -908,7 +1010,7 @@ LEVELS = {
 def variant_level(v):
     if v["mode"] == "size":
         return 4
-    if v["mode"] == "h2":
+    if v["mode"] in ("h2", "proto"):
         return 1
     return LEVELS.get(v["name"], 2)
 
@@ -953,7 +1055,32 @@ def h2_variants(t):
     return out
 
 
-def build_variants(t, modes, param, payload, profile, level=4):
+def parse_protocols(text):
+    """Comma list of h1,h2,h3 -> ordered list, or None when invalid."""
+    if not text:
+        return ["h1", "h2", "h3"]
+    out = []
+    for part in text.split(","):
+        proto = part.strip().lower()
+        if proto not in ("h1", "h2", "h3"):
+            return None
+        if proto not in out:
+            out.append(proto)
+    return out
+
+
+def proto_variants(t, protocols):
+    """The same request replayed over each requested transport."""
+    out = []
+    for proto in protocols:
+        extra = {"proto": proto}
+        if proto == "h2":
+            extra["h2_profile"] = "chrome"
+        out.append(mk("proto", "proto-" + proto, "GET", t.target, **extra))
+    return out
+
+
+def build_variants(t, modes, param, payload, profile, level=4, protocols=None):
     out = []
     if "path" in modes:
         out += path_variants(t)
@@ -973,6 +1100,8 @@ def build_variants(t, modes, param, payload, profile, level=4):
         out += size_variants(t, profile, payload)
     if "h2" in modes:
         out += h2_variants(t)
+    if "proto" in modes:
+        out += proto_variants(t, protocols or ["h1", "h2", "h3"])
     return [v for v in out if variant_level(v) <= level][:MAX_VARIANTS]
 
 
@@ -1032,6 +1161,24 @@ def run(args):
     else:
         payload = DEFAULT_PAYLOAD
 
+    protocols = None
+    if args.protocols:
+        protocols = parse_protocols(args.protocols)
+        if not protocols:
+            return _fail("--protocols must be a comma list of h1,h2,h3")
+        if args.mode == "all":
+            args.mode = "proto"
+        elif args.mode != "proto":
+            return _fail("--protocols is only valid with --mode proto")
+    if args.mode == "proto":
+        protocols = protocols or ["h1", "h2", "h3"]
+        if args.http3:
+            return _fail("--http3 cannot be combined with --mode proto")
+    if args.http3 and args.http2 != "off":
+        return _fail("--http3 and --http2 are mutually exclusive")
+    if args.mode == "h2" and args.http2 == "off":
+        return _fail("--mode h2 needs --http2 <profile>")
+
     if args.mode == "all":
         modes = ["path", "header", "method", "body", "encoding",
                  "cookie", "ctype", "size"]
@@ -1039,8 +1186,8 @@ def run(args):
             modes.append("h2")
     else:
         modes = [args.mode]
-    if args.mode == "h2" and args.http2 == "off":
-        return _fail("--mode h2 needs --http2 <profile>")
+
+    need_h3 = bool(args.http3) or (protocols is not None and "h3" in protocols)
 
     timeout = max(0.5, float(args.timeout))
     threads = max(1, int(args.threads))
@@ -1053,7 +1200,17 @@ def run(args):
         "tls_min": args.tls_min,
         "tls_max": args.tls_max,
         "alpn": [args.alpn] if args.alpn else None,
+        "http3": bool(args.http3) and args.mode != "proto",
+        "h3_python": _h3_python(args),
+        "h3_order": args.h3_order,
+        "h3_max_data": args.h3_max_data,
+        "h3_max_stream_data": args.h3_max_stream_data,
+        "h3_0rtt": bool(args.h3_0rtt),
     }
+    if need_h3:
+        backend_error = check_h3_backend(opts["h3_python"])
+        if backend_error:
+            return _fail(backend_error)
     jar = {} if args.cookies else None
     jar_lock = threading.Lock()
     challenge = None
@@ -1106,7 +1263,7 @@ def run(args):
                  opts, jar, jar_lock)
 
     variants = build_variants(t, modes, args.param, payload, args.profile,
-                              args.level)
+                              args.level, protocols=protocols)
     if not variants:
         return _fail("no variants generated")
 
@@ -1124,7 +1281,8 @@ def run(args):
     for v, resp in results:
         verdict = classify(resp, base, ctrl)
         rows.append({
-            "variant": v["name"],
+            "variant": ("proto-" + resp.proto
+                        if v["mode"] == "proto" else v["name"]),
             "mode": v["mode"],
             "method": getattr(resp, "final_method", v["method"]),
             "status": resp.status,
@@ -1251,6 +1409,10 @@ def run(args):
         "param": args.param,
         "profile": args.profile,
         "http2": args.http2,
+        "http3": opts["http3"],
+        "protocols": protocols,
+        "h3_order": opts["h3_order"],
+        "h3_0rtt": opts["h3_0rtt"],
         "follow": opts["follow"],
         "cookies": jar is not None,
         "max_body": opts["max_body"],
@@ -1378,7 +1540,15 @@ def render(data, as_json, width=None):
     emit(out, "[*] target   %s   mode=%s   level=%d   param=%s   profile=%s"
          % (data["url"], data["mode"], data["level"], data["param"],
             data["profile"]), width)
-    if data["http2"] != "off":
+    if data.get("protocols"):
+        emit(out, "[*] protocols %s (proto replay, h1 baseline)"
+             % ",".join(data["protocols"]), width)
+    elif data.get("http3"):
+        emit(out, "[*] transport h3 (QUIC/UDP, ALPN h3) order=%s 0rtt=%s "
+             "follow=%d cookies=%s"
+             % (data.get("h3_order", "chrome"), data.get("h3_0rtt", False),
+                data["follow"], data["cookies"]), width)
+    elif data["http2"] != "off":
         emit(out, "[*] transport h2 (ALPN h2) profile=%s follow=%d cookies=%s"
              % (data["http2"], data["follow"], data["cookies"]), width)
     elif data["follow"] or data["cookies"]:
@@ -1451,7 +1621,7 @@ def render(data, as_json, width=None):
 
 
 MODE_CHOICES = ["path", "header", "method", "body", "encoding", "cookie",
-                "ctype", "size", "h2", "all"]
+                "ctype", "size", "h2", "proto", "all"]
 
 LEVEL_HELP = (
     "  level 1 = obvious rewrite: //, /./, trailing slash, case toggle,\n"
@@ -1828,6 +1998,10 @@ def fatal_document(message, code, args=None):
         "param": opt("param"),
         "profile": opt("profile"),
         "http2": opt("http2"),
+        "http3": bool(opt("http3", False)),
+        "protocols": parse_protocols(opt("protocols")) if opt("protocols") else None,
+        "h3_order": opt("h3_order"),
+        "h3_0rtt": bool(opt("h3_0rtt", False)),
         "follow": opt("follow", 0) or 0,
         "cookies": bool(opt("cookies", False)),
         "max_body": opt("max_body"),
@@ -1865,7 +2039,7 @@ def main(argv=None):
     ap.add_argument("--banner", action="store_true", help="print banner")
     ap.add_argument("--mode", default="all",
                     choices=["path", "header", "method", "body", "encoding",
-                             "cookie", "ctype", "size", "h2", "all"],
+                             "cookie", "ctype", "size", "h2", "proto", "all"],
                     help="variant family to sweep (default: all)")
     ap.add_argument("--profile", default="generic", choices=sorted(PROFILE_LIMITS),
                     help="vendor profile selecting the size-family limits")
@@ -1874,6 +2048,23 @@ def main(argv=None):
                              "plain"],
                     help="send every request over h2 with this client "
                          "fingerprint profile (default: off)")
+    ap.add_argument("--http3", action="store_true",
+                    help="send every request over HTTP/3 (QUIC/UDP) using the "
+                         "optional aioquic backend")
+    ap.add_argument("--protocols", default=None, metavar="LIST",
+                    help="replay the same request over h1,h2,h3 "
+                         "(implies --mode proto)")
+    ap.add_argument("--h3-python", default=None,
+                    help="interpreter with aioquic installed "
+                         "(default: ./.venv/bin/python)")
+    ap.add_argument("--h3-order", default="chrome", choices=list(H3_ORDERS),
+                    help="QPACK pseudo-header order (default: chrome)")
+    ap.add_argument("--h3-max-data", type=int, default=None,
+                    help="QUIC initial_max_data (aioquic default 1048576)")
+    ap.add_argument("--h3-max-stream-data", type=int, default=None,
+                    help="QUIC initial_max_stream_data_* (aioquic default 1048576)")
+    ap.add_argument("--h3-0rtt", action="store_true",
+                    help="try 0-RTT using a cached session ticket")
     ap.add_argument("--follow", type=int, default=0, metavar="N",
                     help="follow up to N same-host redirects (default 0)")
     ap.add_argument("--cookies", action="store_true",

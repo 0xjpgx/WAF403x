@@ -30,8 +30,15 @@ BYPASS, `2` = fatal (bad URL, baseline failed, solver failed).
 |---|---|---|
 | `-u/--url` | required | target URL (the only host ever contacted) |
 | `--level` | `4` | escalation cap: 1 obvious rewrite, 2 single differential, 3 double layer, 4 null framing/size |
-| `--mode` | `all` | `path`, `header`, `method`, `body`, `encoding`, `cookie`, `ctype`, `size`, `h2`, `all` |
+| `--mode` | `all` | `path`, `header`, `method`, `body`, `encoding`, `cookie`, `ctype`, `size`, `h2`, `proto`, `all` |
 | `--http2` | `off` | send every request as h2 (ALPN `h2`) with profile `chrome`, `firefox`, `safari`, `nghttp2` or `plain` |
+| `--http3` | off | send every request over HTTP/3 (QUIC/UDP, ALPN `h3`) via the optional aioquic backend |
+| `--protocols` | none | replay the same request over `h1,h2,h3` (implies `--mode proto`) |
+| `--h3-python` | `./.venv/bin/python` | interpreter with aioquic installed |
+| `--h3-order` | `chrome` | QPACK pseudo-header order: `chrome`, `firefox`, `safari` |
+| `--h3-max-data` | aioquic default | QUIC `initial_max_data` |
+| `--h3-max-stream-data` | aioquic default | QUIC `initial_max_stream_data_*` |
+| `--h3-0rtt` | off | try 0-RTT with a cached session ticket |
 | `--follow` | `0` | follow up to N same-host redirects |
 | `--cookies` | off | keep a Set-Cookie jar for the whole run |
 | `--max-body` | 1048576 | response body cap in bytes |
@@ -229,6 +236,48 @@ Still not reproducible: exact HPACK indexing decisions, TLS extension order
 (see below), and frame timing. The `h2` mode varies order/profile/priority so
 a gate keyed on one of those inputs shows up as a status or body difference.
 
+## HTTP/3
+
+Reference for the protocol split: https://itsakura.com/http1-1-2-3 — HTTP/1.1
+is text over TCP with no multiplexing and no header compression; HTTP/2 is
+binary over TCP with multiplexing, HPACK header compression and TCP-level
+head-of-line blocking; HTTP/3 runs over QUIC (UDP) with TLS 1.3 integrated,
+QUIC-level multiplexing (no TCP HOL), QPACK and 0-RTT.
+
+h1 and h2 stay stdlib-only. HTTP/3 is an optional transport: `h3.py` runs
+under the project venv and needs `aioquic`; the core process never imports it.
+A missing backend stops the run with one actionable line and the normal fatal
+JSON document (`ok:false`, `exit:2`), never a traceback:
+
+```
+h3 backend missing: aioquic not importable under ./.venv/bin/python (...);
+install with: python3 -m venv .venv && .venv/bin/pip install aioquic
+```
+
+`--http3` switches the whole run (baseline, control, every variant) to QUIC v1
+with ALPN `h3`. `--mode proto --protocols h1,h2,h3` (or bare
+`--protocols h1,h2,h3`) replays the identical GET across the selected
+transports and labels each row with the transport actually used
+(`proto-h1`, `proto-h2`, `proto-h3`); baseline and control stay on h1.
+`--http3` and `--http2` are mutually exclusive. Redirects, cookies,
+`--max-body` and `--timeout` use the same fetch loop as h1/h2; a fatal h3
+transport failure produces the same fatal JSON document and exit 2.
+
+Controllable fingerprint inputs (aioquic backend):
+
+| Knob | Flag / value | Notes |
+|---|---|---|
+| ALPN | always `h3` | required by the transport |
+| `initial_max_data` | `--h3-max-data N` | aioquic default 1048576 |
+| `initial_max_stream_data_*` | `--h3-max-stream-data N` | maps to bidi-local, bidi-remote and uni |
+| QPACK pseudo-header order | `--h3-order chrome\|firefox\|safari` | list order is what goes on the wire |
+| 0-RTT | `--h3-0rtt` | off by default; uses `~/.cache/wafbypass/h3-<host>.ticket` from a prior run |
+| QUIC version, max_udp_payload_size, active_connection_id_limit, TLS extensions, congestion | — | decided by aioquic/OpenSSL, not exposed |
+
+0-RTT needs a cached session ticket; a first run with `--h3-0rtt` establishes
+and stores one, a later run offers early data and reports whether it was
+accepted. Without a ticket the run proceeds at 1-RTT.
+
 ## Challenge solving
 
 `--solve-challenge` runs `challenge.py` under the solver venv with
@@ -264,8 +313,8 @@ per-run Set-Cookie jar, which is also what a minted challenge cookie needs.
 
 `--json` emits exactly one document on stdout. A normal scan starts with
 `"ok": true` and carries the top-level keys `url, mode, level, param, profile,
-http2, follow, cookies, max_body, challenge, payload, baseline, control, rows,
-summary`. Every element of `rows` has the same fixed key set, whatever the
+http2, http3, protocols, h3_order, h3_0rtt, follow, cookies, max_body,
+challenge, payload, baseline, control, rows, summary`. Every element of `rows` has the same fixed key set, whatever the
 verdict:
 
 ```
